@@ -1,0 +1,38 @@
+import Foundation
+
+/// Logging for the auth path, with redaction baked in.
+///
+/// The auth flow is the one part of Bounce you cannot debug by looking at the
+/// screen — it either silently works or fails with a generic message. So it
+/// logs. But it handles a partner secret and bearer tokens, and a log line is
+/// forever: Xcode's console, sysdiagnose, a screenshot in a bug report. Hence a
+/// dedicated helper rather than bare `print`, so redaction is the default
+/// rather than something to remember.
+///
+/// Debug builds only. Nothing here ships in Release.
+enum AuthLog {
+
+    static func log(_ message: String) {
+        #if DEBUG
+        print("[Auth] \(message)")
+        #endif
+    }
+
+    /// Fingerprint a secret so you can tell "it changed" or "it's empty"
+    /// without the value ever reaching the log.
+    ///
+    /// Shows length and the first two characters only — enough to catch a
+    /// paste that grabbed whitespace or truncated, useless to anyone reading
+    /// the log later.
+    static func redacted(_ secret: String) -> String {
+        guard !secret.isEmpty else { return "<empty>" }
+        let prefix = secret.prefix(2)
+        return "\(prefix)…(\(secret.count) chars)"
+    }
+
+    /// Tokens get length only. Even a prefix of a JWT leaks the header, which
+    /// identifies the algorithm and sometimes the key id.
+    static func tokenSummary(_ token: String) -> String {
+        token.isEmpty ? "<empty>" : "<\(token.count) chars>"
+    }
+}

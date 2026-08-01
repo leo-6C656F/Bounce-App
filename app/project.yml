@@ -1,0 +1,335 @@
+name: Bounce
+options:
+  bundleIdPrefix: com.teampandora
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+
+# No xcconfig, and no credentials anywhere in the build. Plaud credentials are
+# entered at runtime and held in the keychain — see Auth/TokenProvider.swift.
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  WiFi Fast Transfer is currently ON — all three blocks marked
+#  "[WIFI FAST TRANSFER]" below are live. It needs entitlements that only a
+#  PAID Apple Developer Program membership can sign; a free Personal Team
+#  cannot, and the build fails to sign if they are declared without one.
+#
+#  If this device/team does NOT have a paid membership, comment out all THREE
+#  blocks marked "[WIFI FAST TRANSFER]" below together, then run
+#  `xcodegen generate`. Uncomment/comment them as a set, not individually —
+#  see the note on `NSLocationWhenInUseUsageDescription` below for the
+#  specific historical trap (now fixed by keeping that key unconditional) that
+#  a partial toggle used to cause. No Swift changes are needed either way —
+#  see App/AppCapabilities.swift.
+# ═══════════════════════════════════════════════════════════════════════════
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_STRICT_CONCURRENCY: minimal
+  # A base-level SWIFT_ACTIVE_COMPILATION_CONDITIONS applies identically to
+  # every configuration. XcodeGen builds this project from scratch with no
+  # Xcode-template xcconfig underneath it, so nothing else ever defines DEBUG —
+  # setting the WiFi Fast Transfer flag here previously left DEBUG undefined in
+  # the Debug configuration too, silently compiling out every `#if DEBUG` log
+  # (TranscribeLog, DeviceLog, AuthLog) in both Debug *and* Release builds.
+  #
+  # [BACKGROUND DESKTOP] Lets the desktop view survive the app being backgrounded,
+  # by playing silence through the `audio` background mode (`BackgroundResidency`).
+  # **This is an App Store rejection** — Apple treats silent audio as an abuse of
+  # background residency. It is on here because this build is sideloaded to one
+  # device. Remove the flag from both configurations before submitting: with it
+  # off, `BackgroundResidency` compiles to a no-op and the desktop view reverts to
+  # foreground-only plus the review-safe mid-recording fallback in
+  # `DesktopServer.enterBackground`. Nothing else needs changing — no entitlement,
+  # no Info.plist key, and `UIBackgroundModes: audio` is already declared for
+  # playback.
+  configs:
+    Debug:
+      # [WIFI FAST TRANSFER] 1 of 3 — ON (paid membership signs the entitlements)
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) DEBUG BOUNCE_WIFI_FAST_TRANSFER BOUNCE_BACKGROUND_DESKTOP
+    Release:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) BOUNCE_WIFI_FAST_TRANSFER BOUNCE_BACKGROUND_DESKTOP
+
+targets:
+  Bounce:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    settings:
+      base:
+        # iPhone only. **Must be set on the target, not on the project's
+        # `settings.base`** — XcodeGen writes its own `TARGETED_DEVICE_FAMILY` per
+        # iOS target, and a target-level value wins, so a project-level one is
+        # silently ignored. It was set there first and the warning survived.
+        #
+        # Unset, this is "1,2" — iPhone *and* iPad — which is what produced Xcode's
+        # "All interface orientations must be supported unless the app requires
+        # full screen": an iPad app must support all four orientations or declare
+        # `UIRequiresFullScreen`, and this declares portrait only.
+        #
+        # Declaring iPhone is the honest fix rather than silencing the warning. The
+        # UI assumes phone width throughout — the recording screen, the live
+        # transcript, and the audio editor's gesture targets — so an iPad build
+        # would run today, badly. Making it genuinely universal is Phase 13 of
+        # `docs/plans/feedback-board-top-15.md`; flip this to "1,2" there, with
+        # `UISupportedInterfaceOrientations~ipad`, not before.
+        TARGETED_DEVICE_FAMILY: "1"
+    # [WIFI FAST TRANSFER] 2 of 3 — ON
+    entitlements:
+      path: Bounce/Bounce.entitlements
+      properties:
+        com.apple.developer.networking.HotspotConfiguration: true
+        com.apple.developer.networking.wifi-info: true
+    sources:
+      - path: Bounce
+      # The one file compiled into BOTH the app and the watch app: the message
+      # keys and state snapshot they exchange. Kept outside `Bounce/` so the
+      # watch target can list it without also sweeping up the iOS app.
+      - path: Shared
+      # The SDK looks for this resource bundle in the app bundle, so it has to
+      # land in Copy Bundle Resources. XcodeGen has no top-level `resources:`
+      # target key — declaring it here with an explicit buildPhase is the only
+      # thing that actually works. (The upstream Plaud template uses
+      # `resources:`, which XcodeGen silently ignores.)
+      - path: ../sdk/ios/PlaudDeviceBasicSDK.bundle
+        buildPhase: resources
+      # The desktop view's web client. Kept outside `Bounce/` so it can carry an
+      # explicit `buildPhase: resources` without also being swept up by the
+      # recursive `path: Bounce` above (which would have XcodeGen emit two build
+      # rules for the same file). Same reason as the SDK bundle: there is no
+      # top-level `resources:` key, and declaring one is ignored in silence.
+      # `WebClient.swift` serves a diagnostic page if this fails to copy.
+      - path: WebClient
+        buildPhase: resources
+    dependencies:
+      - framework: ../sdk/ios/PlaudDeviceBasicSDK.framework
+        embed: true
+      - framework: ../sdk/ios/PlaudBleSDK.framework
+        embed: true
+      - framework: ../sdk/ios/PlaudWiFiSDK.framework
+        embed: true
+      # The Live Activity UI lives in this widget extension, embedded in the app.
+      - target: BounceWidgets
+        embed: true
+      # [WATCH APP] 1 of 1 — OFF.
+      #
+      # Embedding the watch app is how a watch app is installed at all; there is
+      # no separate install. It is commented out because turning it on changes
+      # how the whole project must be built, and the two requirements are real:
+      #
+      #  1. **`-target Bounce -sdk iphoneos` stops working.** `-sdk` is forced
+      #     onto dependencies, so the watch sources compile against the iOS SDK.
+      #     That fails loudly today (`WCSessionDelegate` has different
+      #     requirements per platform) — which is the good outcome; the bad one
+      #     would be succeeding and embedding an iOS binary as a watch app.
+      #     With this on, build with:
+      #       xcodebuild -project Bounce.xcodeproj -scheme Bounce \
+      #         -destination "generic/platform=iOS" \
+      #         -configuration Debug CODE_SIGNING_ALLOWED=NO build
+      #  2. **The watchOS *runtime* must be installed**, not just the SDK.
+      #     `xcodebuild -showsdks` listing `watchos26.5` is not enough: a scheme
+      #     with an embedded watch app refuses to resolve with
+      #     "watchOS 26.5 must be installed in order to run the scheme". Fix with
+      #     `xcodebuild -downloadPlatform watchOS`. This is the same misleading
+      #     error class as the iOS one documented in CLAUDE.md — it wants a
+      #     simulator runtime even for a device build.
+      #
+      # The watch target builds and is verified on its own either way:
+      #   xcodebuild -project Bounce.xcodeproj -target BounceWatch -sdk watchos \
+      #     -configuration Debug CODE_SIGNING_ALLOWED=NO build
+      # - target: BounceWatch
+      #   embed: true
+    info:
+      path: Bounce/Info.plist
+      properties:
+        CFBundleDisplayName: Bounce
+        # Launch screen. Deliberately the modern `UILaunchScreen` dictionary
+        # (iOS 14+) and not a LaunchScreen.storyboard — a storyboard would be the
+        # only UIKit view in the project, and the UI conventions rule that out.
+        #
+        # `UIColorName` and `UIImageName` are asset-catalog names, resolved out of
+        # `Bounce/Resources/Assets.xcassets` (which reaches Copy Bundle Resources
+        # via the recursive `path: Bounce` source above — XcodeGen detects
+        # `.xcassets` itself, so no separate `buildPhase: resources` entry is
+        # needed for it, unlike the SDK bundle and WebClient). Both assets carry a
+        # `luminosity: dark` variant, so the launch screen follows the system
+        # appearance instead of flashing white into a dark app.
+        #
+        # The background stays the app's OWN first-frame background rather than a
+        # brand colour, so only the mark disappears at hand-off and there is no
+        # full-screen colour step — the point of Apple's "downplay the launch"
+        # guidance. `LaunchBackground.colorset` therefore reproduces
+        # `systemGroupedBackground` (#F2F2F7 light / #000 dark), NOT
+        # `systemBackground`: the returning-user first screen is HomeView's
+        # `NavigationStack { List { … } }`, and a List's default background is the
+        # grouped one. This key used to read `systemBackground`, which put a ~5%
+        # full-screen luminance step at hand-off in light mode. If HomeView ever
+        # stops being a List, re-check this value. `LaunchLogo` is generated by
+        # `tools/make-launch-logo.swift` from the same geometry and gradient as
+        # the app icon; see that script's header for the colours that must move
+        # together.
+        #
+        # `UILaunchScreen` centres `UIImageName` at the asset's natural point size
+        # and exposes no content mode, so the 176×110pt in that script is
+        # literally the on-screen size on every device — resize there, not here.
+        # Do NOT add a `UIStatusBarStyle` key inside this dictionary: it is a
+        # top-level Info.plist key and is silently ignored in here.
+        #
+        # iOS caches the rendered launch screen aggressively. After changing any
+        # of this, DELETE THE APP from the device and reinstall — a rebuild alone
+        # keeps showing the old one, which reads exactly like the keys not working.
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+          UIImageName: LaunchLogo
+          # Centre in the full screen, not the safe area. With `true` the mark
+          # sits ~12pt low on a Dynamic Island iPhone, whose top inset exceeds its
+          # bottom one. `false` is also the default; stated to record the intent.
+          UIImageRespectsSafeAreaInsets: false
+        NSFaceIDUsageDescription: Face ID protects your stored Plaud credentials, so only you can view or change them.
+        # Reading events needs FULL access, not write-only: iOS 17 split calendar
+        # authorization, and `EKEventStore.requestFullAccessToEvents()` is refused
+        # without this exact key. Deliberately outside the [WIFI FAST TRANSFER]
+        # blocks — it is a plist key, not a signable entitlement, so it carries no
+        # paid-membership requirement.
+        # This string used to promise "nothing is written to your calendar". That
+        # stopped being true when task events were added, so it was rewritten rather
+        # than left as a comfortable lie — the read and write halves are separate
+        # opt-in features and the string now says so.
+        NSCalendarsFullAccessUsageDescription: Bounce reads your calendar to name recordings after the meeting they happened in, and to suggest who was speaking. If you switch on calendar reminders for tasks, it also adds events for tasks that have a deadline — only ones it created, never anything else. Both are off until you turn them on, and nothing leaves this iPhone.
+        # A **separate** permission from calendars, even though both are EventKit
+        # and the same `EKEventStore`: granting calendar access does not grant this.
+        # Full access is required because Bounce both reads reminders back (to see
+        # what you've ticked off) and writes them.
+        NSRemindersFullAccessUsageDescription: Bounce mirrors the tasks it finds in your recordings into Apple Reminders, and reads them back so ticking one off in either app keeps both in step. Only tasks Bounce created are touched, and nothing leaves this iPhone.
+        NSBluetoothAlwaysUsageDescription: Bounce uses Bluetooth to connect to your Plaud recorder and pull recordings off it.
+        NSBluetoothPeripheralUsageDescription: Bounce uses Bluetooth to connect to your Plaud recorder and pull recordings off it.
+        NSSpeechRecognitionUsageDescription: Bounce transcribes your recordings entirely on this iPhone. Audio is never uploaded for transcription.
+        # Lets the recording show on the Lock Screen and Dynamic Island as a Live
+        # Activity. A plist key, not a signable entitlement — no paid-membership
+        # requirement (unlike WiFi Fast Transfer above).
+        NSSupportsLiveActivities: true
+        # Location, for two unrelated features:
+        #   1. Geotagging recordings (`Location/LocationCapture.swift`), which is
+        #      why this key is **outside** the [WIFI FAST TRANSFER] blocks. It is
+        #      a plist key, not a signable entitlement, so it carries no
+        #      paid-membership requirement — same reasoning as the calendar keys
+        #      above.
+        #   2. WiFi Fast Transfer, because NEHotspotConfigurationManager demands
+        #      location permission on iOS 13+.
+        # It used to live inside block 3 of 3 and promised "Bounce never stores
+        # or transmits your location", which geotagging made untrue — and worse,
+        # commenting that block out for a free Personal Team would have removed
+        # the key while `LocationCapture.requestAccess()` still called
+        # `requestWhenInUseAuthorization()`, which **terminates the app**. See
+        # `App/AppCapabilities.swift` for that trap in its original form.
+        NSLocationWhenInUseUsageDescription: Bounce tags a recording with where it happened, so you can find meetings on a map. It takes a single location reading when your recorder starts recording or when a recording syncs — never in the background, and never continuously. Locations stay on this iPhone.
+        # NOT one of the [WIFI FAST TRANSFER] blocks, on purpose, even though
+        # WiFi Fast Transfer is one of the two features that need it — same
+        # reasoning as the location key above: Desktop View (always-on, not
+        # gated behind BOUNCE_WIFI_FAST_TRANSFER) needs this key too, for its
+        # Bonjour/mDNS local-network access. A prior version of this file
+        # labeled this "[WIFI FAST TRANSFER] 3 of 3", which would tell a future
+        # maintainer reverting WiFi Fast Transfer for a free Personal Team to
+        # delete this key along with the other two blocks — silently breaking
+        # Desktop View's discoverability along with it. Keep it here,
+        # unconditional, regardless of the WiFi Fast Transfer flag state.
+        NSLocalNetworkUsageDescription: Bounce uses the local network for WiFi Fast Transfer, which moves recordings off your recorder about ten times faster than Bluetooth, and for Desktop view, which serves your library to a browser on this network.
+        # Bonjour service types the app registers, for Desktop view's
+        # discoverability. Without the declaration the mDNS registration is
+        # refused with kDNSServiceErr_NoAuth (-65555) — and NWListener reports
+        # that by failing the entire listener, not just the advertisement.
+        # `DesktopServer` retries without advertising if this still fails, so a
+        # missing entry degrades to "reachable by IP only" rather than breaking.
+        NSBonjourServices:
+          - _http._tcp
+        UIBackgroundModes:
+          - bluetooth-central
+          # Playback of a synced recording continues with the screen locked, and
+          # is what makes the Lock Screen / Control Centre / AirPods transport
+          # (MPRemoteCommandCenter, wired in AudioPlayerModel) work at all. Note
+          # those controls only appear when the player takes a non-mixing
+          # `.playback` session, i.e. when no recorder is connected — see
+          # `AudioPlayerModel.activatePlaybackSession(mixing:)`.
+          - audio
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+
+  # Widget extension carrying the recording Live Activity (Lock Screen + Dynamic
+  # Island). Local-updates only: no entitlements block, no App Group, no push —
+  # so nothing here needs a capability a paid membership must provision. The
+  # shared attributes/intents files are members of both this target and the app.
+  BounceWidgets:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: BounceWidgets
+      - path: Bounce/LiveActivity/RecordingActivityAttributes.swift
+      - path: Bounce/LiveActivity/RecordingIntents.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.teampandora.Bounce.Widgets
+        SWIFT_VERSION: "5.0"
+    info:
+      path: BounceWidgets/Info.plist
+      properties:
+        CFBundleDisplayName: Bounce
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+
+  # The watch app. A remote control for the PHONE, not for the recorder: the
+  # Plaud SDK ships an arm64 iOS slice only and a recorder binds to one app over
+  # Bluetooth, so every command is relayed through `Bounce/Watch/WatchBridge.swift`.
+  # See `Shared/WatchLink.swift`.
+  #
+  # watchOS 26 to match the project's iOS 26 floor — this repo carries no
+  # back-compatibility anywhere else and a second policy for one target would be
+  # a surprise. Nothing here needs a recent API; the constraint is consistency.
+  BounceWatch:
+    type: application
+    platform: watchOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: BounceWatch
+      - path: Shared
+    settings:
+      base:
+        # `.watchkitapp` is not a free-form suffix: the pairing between a watch
+        # app and its companion is by bundle id, and `WKCompanionAppBundleIdentifier`
+        # below has to name the iOS app exactly.
+        PRODUCT_BUNDLE_IDENTIFIER: com.teampandora.Bounce.watchkitapp
+        SWIFT_VERSION: "5.0"
+        # 4 is Apple Watch. Set explicitly for the same reason the app sets 1:
+        # XcodeGen writes a per-target value and an unset one is not the default
+        # anyone expects.
+        TARGETED_DEVICE_FAMILY: "4"
+    info:
+      path: BounceWatch/Info.plist
+      properties:
+        CFBundleDisplayName: Bounce
+        # The modern single-target watch app (watchOS 7+). Without this key the
+        # app is treated as a legacy WatchKit extension pair and won't launch.
+        WKApplication: true
+        WKCompanionAppBundleIdentifier: com.teampandora.Bounce
+
+# Only the app gets a runnable scheme. Without this, XcodeGen also generates a
+# "BounceWidgets" scheme; running that tries to launch the widget extension
+# standalone, which fails ("Failed to show Widget … Failed to get descriptors")
+# because a Live-Activity-only extension has no home-screen widget to show. The
+# extension is still built and embedded via the app's dependency.
+schemes:
+  Bounce:
+    build:
+      targets:
+        Bounce: all
+    run:
+      config: Debug
+    profile:
+      config: Debug
+    analyze:
+      config: Debug
+    archive:
+      config: Debug

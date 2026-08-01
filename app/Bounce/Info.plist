@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Bounce</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Bounce uses Bluetooth to connect to your Plaud recorder and pull recordings off it.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Bounce uses Bluetooth to connect to your Plaud recorder and pull recordings off it.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+	</array>
+	<key>NSCalendarsFullAccessUsageDescription</key>
+	<string>Bounce reads your calendar to name recordings after the meeting they happened in, and to suggest who was speaking. If you switch on calendar reminders for tasks, it also adds events for tasks that have a deadline — only ones it created, never anything else. Both are off until you turn them on, and nothing leaves this iPhone.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Face ID protects your stored Plaud credentials, so only you can view or change them.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Bounce uses the local network for WiFi Fast Transfer, which moves recordings off your recorder about ten times faster than Bluetooth, and for Desktop view, which serves your library to a browser on this network.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Bounce tags a recording with where it happened, so you can find meetings on a map. It takes a single location reading when your recorder starts recording or when a recording syncs — never in the background, and never continuously. Locations stay on this iPhone.</string>
+	<key>NSRemindersFullAccessUsageDescription</key>
+	<string>Bounce mirrors the tasks it finds in your recordings into Apple Reminders, and reads them back so ticking one off in either app keeps both in step. Only tasks Bounce created are touched, and nothing leaves this iPhone.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Bounce transcribes your recordings entirely on this iPhone. Audio is never uploaded for transcription.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+		<string>audio</string>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string>LaunchBackground</string>
+		<key>UIImageName</key>
+		<string>LaunchLogo</string>
+		<key>UIImageRespectsSafeAreaInsets</key>
+		<false/>
+	</dict>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+</dict>
+</plist>

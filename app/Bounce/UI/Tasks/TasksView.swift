@@ -1,0 +1,323 @@
+import SwiftUI
+
+/// Every action item across the library, grouped by the recording it came from.
+///
+/// The items themselves are extracted per recording by `AutoOrganizer` and
+/// stored on `Recording.actionItems`; this is a second presentation over that
+/// same data, not a separate store. Grouped by recording rather than flattened,
+/// because an action divorced from the conversation it came from is hard to act
+/// on — and tapping through to the recording, seeked to where it was said, is
+/// the point.
+///
+/// The grouping is unchanged from the first version; what changed is that a
+/// group now looks like the recording it belongs to. A bare uppercase title over
+/// a white box gave no clue which recording it was, and made a one-task
+/// recording cost a header as tall as the task under it.
+struct TasksView: View {
+
+    @Environment(AppModel.self) private var model
+
+    enum TaskFilterMode: String, CaseIterable, Identifiable {
+        case pending = "Open"
+        case completed = "Done"
+        case all = "All"
+
+        var id: String { rawValue }
+    }
+
+    @State private var filterMode: TaskFilterMode = .pending
+    @State private var searchText = ""
+    @State private var isAdding = false
+    @State private var draftText = ""
+    /// Which recording a hand-added item belongs to.
+    @State private var addTarget: Recording?
+
+    private var transcribedRecordings: [Recording] {
+        model.recordings.filter(\.isTranscribed)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if groups.isEmpty { emptyState } else { list }
+            }
+            .navigationTitle("Tasks")
+            .searchable(text: $searchText, prompt: "Search tasks")
+            .safeAreaBar(edge: .top) { filterBar }
+            .safeAreaInset(edge: .bottom) { scanProgress }
+            .toolbar { toolbarContent }
+            .alert("New task", isPresented: $isAdding) {
+                TextField("What needs doing", text: $draftText)
+                Button("Add") {
+                    if let addTarget { model.addActionItem(draftText, to: addTarget) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text(addTarget.map { "Added to “\($0.displayTitle)”." } ?? "")
+            }
+        }
+    }
+
+    // MARK: - Chrome
+
+    /// Chips rather than a segmented control, matching the Library's category
+    /// filters — the two screens filter the same library and shouldn't use two
+    /// different controls to say so. The count rides on the active chip so the
+    /// header doesn't need a second line to report it.
+    private var filterBar: some View {
+        HStack(spacing: 8) {
+            ForEach(TaskFilterMode.allCases) { mode in
+                let isActive = filterMode == mode
+                Button {
+                    filterMode = mode
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(mode.rawValue)
+                        if isActive, count(for: mode) > 0 {
+                            Text("\(count(for: mode))")
+                                .monospacedDigit()
+                                .opacity(0.7)
+                        }
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                .background(
+                    isActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.background.secondary),
+                    in: .capsule)
+                .accessibilityAddTraits(isActive ? [.isSelected] : [])
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 8)
+    }
+
+    private func count(for mode: TaskFilterMode) -> Int {
+        let all = model.allActionItems
+        switch mode {
+        case .pending: return all.filter { !$0.item.isDone }.count
+        case .completed: return all.filter { $0.item.isDone }.count
+        case .all: return all.count
+        }
+    }
+
+    @ViewBuilder
+    private var scanProgress: some View {
+        if let scan = model.actionItemScan {
+            VStack(spacing: 6) {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reading recording \(scan.done + 1) of \(scan.total)…")
+                        .font(.footnote)
+                    Spacer()
+                }
+                ProgressView(value: Double(scan.done), total: Double(max(scan.total, 1)))
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .background(.bar)
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        if let newest = transcribedRecordings.first {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Section("Add task to recent recording") {
+                        ForEach(transcribedRecordings.prefix(8)) { recording in
+                            Button(recording.displayTitle) {
+                                addTarget = recording
+                                draftText = ""
+                                isAdding = true
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Add task", systemImage: "plus")
+                } primaryAction: {
+                    addTarget = newest
+                    draftText = ""
+                    isAdding = true
+                }
+            }
+        }
+
+        ToolbarItem(placement: .topBarTrailing) {
+            let pending = model.recordingsNeedingActionItemScan
+            if pending > 0, model.actionItemScan == nil {
+                Button {
+                    model.scanForActionItems()
+                } label: {
+                    Label("Scan older recordings", systemImage: "sparkles.rectangle.stack")
+                }
+            }
+        }
+    }
+
+    // MARK: - List
+
+    private var list: some View {
+        List {
+            ForEach(groups, id: \.recording.id) { group in
+                Section {
+                    ForEach(group.items) { item in
+                        NavigationLink {
+                            RecordingDetailView(recording: group.recording)
+                        } label: {
+                            row(item, in: group.recording)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button("Delete", systemImage: "trash", role: .destructive) {
+                                model.deleteActionItem(item, in: group.recording)
+                            }
+                        }
+                        .swipeActions(edge: .leading) {
+                            Button(item.isDone ? "Reopen" : "Done", systemImage: item.isDone ? "arrow.uturn.backward" : "checkmark") {
+                                model.setActionItem(item, in: group.recording, done: !item.isDone)
+                            }
+                            .tint(item.isDone ? .orange : .green)
+                        }
+                    }
+                } header: {
+                    header(for: group)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .scrollEdgeEffectStyle(.soft, for: .top)
+    }
+
+    /// The recording a group of tasks came from, rendered as the recording
+    /// rather than as a caption: its category glyph, its title in sentence case,
+    /// and how much of it is left.
+    private func header(for group: RecordingTasks) -> some View {
+        HStack(spacing: 10) {
+            CategoryGlyph(categoryName: group.recording.categoryName)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(group.recording.displayTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(group.recording.createdAt.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer(minLength: 0)
+
+            if group.total > 0, group.done > 0 {
+                StatusChip(text: "\(group.done)/\(group.total)", tint: .accentColor)
+            }
+        }
+        .textCase(nil)
+        .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func row(_ item: ActionItem, in recording: Recording) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Button {
+                model.setActionItem(item, in: recording, done: !item.isDone)
+            } label: {
+                Image(systemName: item.isDone ? "checkmark.circle.fill" : "circle")
+                    .font(.title3)
+                    .foregroundStyle(item.isDone ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
+                    .contentTransition(.symbolEffect(.replace))
+                    .symbolEffect(.bounce, value: item.isDone)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(item.isDone ? "Mark as not done" : "Mark as done")
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.text)
+                    .strikethrough(item.isDone)
+                    .foregroundStyle(item.isDone ? .secondary : .primary)
+
+                HStack(spacing: 8) {
+                    if let detail = item.detail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    // Where it was said. A timecode is the fastest way back into
+                    // the conversation, and it is the whole reason these stay
+                    // grouped by recording.
+                    if let offset = item.sourceOffset {
+                        Text(offset.timecodeText)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.tint)
+                            .accessibilityLabel("said at \(offset.spokenTimecode)")
+                    }
+                }
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    @ViewBuilder
+    private var emptyState: some View {
+        if !searchText.isEmpty {
+            EmptyHint(
+                symbol: "magnifyingglass",
+                title: "No tasks found",
+                message: "No action items match “\(searchText)”.")
+        } else if model.allActionItems.isEmpty {
+            EmptyHint(
+                symbol: "checklist",
+                title: "No tasks yet",
+                message: "Bounce pulls action items out of your recordings after transcribing them. You can also add one using the + button.")
+        } else {
+            EmptyHint(
+                symbol: filterMode == .completed ? "checkmark.circle" : "checklist.checked",
+                title: filterMode == .completed ? "No completed tasks" : "All caught up!",
+                message: filterMode == .completed ? "Tasks you complete will show up here." : "No open action items right now.")
+        }
+    }
+
+    // MARK: - Grouping
+
+    struct RecordingTasks {
+        let recording: Recording
+        let items: [ActionItem]
+        /// Counted over **all** the recording's items, not the filtered slice —
+        /// "2/5" has to mean two of the recording's five, or the chip reads as
+        /// "2 of the 2 currently shown" and never moves.
+        let done: Int
+        let total: Int
+    }
+
+    private var groups: [RecordingTasks] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        return model.recordings.compactMap { recording in
+            let all = recording.actionItems ?? []
+            let items = all.filter { item in
+                switch filterMode {
+                case .pending: if item.isDone { return false }
+                case .completed: if !item.isDone { return false }
+                case .all: break
+                }
+
+                if !query.isEmpty {
+                    let matchesText = item.text.lowercased().contains(query)
+                    let matchesDetail = item.detail?.lowercased().contains(query) ?? false
+                    return matchesText || matchesDetail
+                }
+
+                return true
+            }
+            guard !items.isEmpty else { return nil }
+            return RecordingTasks(
+                recording: recording,
+                items: items,
+                done: all.filter(\.isDone).count,
+                total: all.count)
+        }
+    }
+}
