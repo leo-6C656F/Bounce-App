@@ -64,11 +64,22 @@ final class AutoOrganizer {
             }
         }
 
-        // Look up the calendar regardless — the event title and attendees are worth
-        // recording even when they aren't used to name anything, since the attendees
-        // seed speaker naming. Silent when access was never granted or nothing
-        // overlapped.
-        let event = matchingCalendarEvent(for: recording)
+        // A calendar link the user set or cleared by hand is authoritative and
+        // must survive this re-run untouched — so skip the lookup entirely rather
+        // than re-guess it. See `Recording.calendarLinkConfirmed`.
+        let userOwnsCalendarLink = recording.calendarLinkConfirmed == true
+
+        // Look up the calendar. Only a *high-confidence*, unambiguous match links
+        // automatically; a weaker one is left for the manual picker (the detail
+        // view's Meeting card) so a wrong guess never lands silently. Silent when
+        // access was never granted or nothing overlapped.
+        //
+        // Nothing overlapping is common and expected here: the recording's
+        // timestamp is the *recorder's* clock, which drifts from the phone, so a
+        // real meeting can fall outside the match window. That is precisely the
+        // case the picker recovers — see `CalendarMatching.defaultTolerance`.
+        let match = userOwnsCalendarLink ? nil : matchingCalendarEvent(for: recording)
+        let confidentEvent = match?.confidence == .high ? match?.event : nil
 
         // A recurring calendar event *is* a meeting series, and its external
         // identifier is the same for every occurrence — so this groups sessions
@@ -77,10 +88,11 @@ final class AutoOrganizer {
         // stores the id.
         //
         // Never reassigns: a recording the user has already filed into a series by
-        // hand keeps that series, even if the calendar disagrees.
+        // hand keeps that series, even if the calendar disagrees. Only a confident
+        // match auto-groups — a low-confidence guess would fork a series wrongly.
         var seriesId = recording.seriesId
-        if seriesId == nil, let event, let key = event.seriesKey {
-            let name = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if seriesId == nil, let confidentEvent, let key = confidentEvent.seriesKey {
+            let name = confidentEvent.title.trimmingCharacters(in: .whitespacesAndNewlines)
             if !name.isEmpty,
                let series = MeetingSeriesStore.shared.ensureSeries(calendarKey: key, name: name) {
                 seriesId = series.id
@@ -95,7 +107,7 @@ final class AutoOrganizer {
             untitledPlaceholder: Recording.untitled,
             recordingStart: recording.createdAt,
             recordingDuration: recording.duration,
-            event: event,
+            event: confidentEvent,
             categoryAllowsCalendarTitles: matched?.allowsCalendarTitle ?? true,
             aiTitle: aiTitle,
             existingTitles: RecordingStore.shared.recordings
@@ -106,16 +118,16 @@ final class AutoOrganizer {
         persist(recordingId) { rec in
             if let matched { rec.categoryName = matched.name }
             if let seriesId { rec.seriesId = seriesId }
-            if let event {
-                let eventTitle = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let confidentEvent {
+                let eventTitle = confidentEvent.title.trimmingCharacters(in: .whitespacesAndNewlines)
                 rec.calendarEventTitle = eventTitle.isEmpty ? nil : eventTitle
-                rec.calendarAttendees = event.attendees.isEmpty ? nil : event.attendees
+                rec.calendarAttendees = confidentEvent.attendees.isEmpty ? nil : confidentEvent.attendees
                 // The meeting's own coordinates beat a sync-time fix and cost
                 // nothing — but never beat a fix taken while it was recording,
                 // which is what `shouldBeReplaced(by:)` enforces. Gated on the
                 // geotag setting: an event's location is still the user's
                 // whereabouts, and calendar matching is not consent for that.
-                if DeliverySettings.shared.geotagRecordings, let place = event.place {
+                if DeliverySettings.shared.geotagRecordings, let place = confidentEvent.place {
                     if rec.place?.shouldBeReplaced(by: place) ?? true { rec.place = place }
                 }
             }
@@ -269,10 +281,12 @@ final class AutoOrganizer {
     /// Silent on every exit, matching every other guard here: the setting off,
     /// access never granted, or no overlapping event all simply return nil.
     /// Attendee names are personal data and are never logged.
-    private func matchingCalendarEvent(for recording: Recording) -> CandidateEvent? {
+    private func matchingCalendarEvent(
+        for recording: Recording
+    ) -> (event: CandidateEvent, confidence: CalendarMatching.MatchConfidence)? {
         guard DeliverySettings.shared.calendarTitles else { return nil }
         guard CalendarMatcher.shared.canReadEvents else { return nil }
-        return CalendarMatcher.shared.match(
+        return CalendarMatcher.shared.evaluate(
             recordingStart: recording.createdAt,
             duration: recording.duration)
     }
@@ -326,6 +340,11 @@ final class AutoOrganizer {
         for await partial in generator.generate(transcript: transcript, template: template) {
             final = partial
         }
+        // A failed run yields its apology ("Couldn't generate this summary…")
+        // into the stream, so `final` is non-empty and would otherwise be stored
+        // as a real summary *and* delivered to the webhook. `lastError` is the
+        // documented guard for any caller that persists the stream's last value.
+        guard generator.lastError == nil else { return }
         guard !final.isEmpty else { return }
         let summary = Summary(
             templateId: template.id,

@@ -296,11 +296,11 @@ final class AppModel {
             }
             deviceManager.rescanIfNeeded()
             // On foreground rather than a timer: this is where a task ticked off in
-            // Reminders while Bounce was closed gets noticed. No-ops when the
-            // setting is off or permission was never granted.
-            await syncReminders()
-            await syncTaskCalendar()
-            await sendTaskWebhooks()
+            // Reminders while Bounce was closed gets noticed, and where a pushed
+            // task's date change is reconciled. No-ops when the setting is off or
+            // permission was never granted, and — crucially — never *creates*
+            // anything for a task the user hasn't explicitly pushed.
+            await deliverPushedTasks()
         }
     }
 
@@ -411,6 +411,71 @@ final class AppModel {
     /// nothing later overwrites it.
     func setPlace(_ place: RecordingPlace?, on recording: Recording) {
         RecordingStore.shared.update(id: recording.id) { $0.place = place }
+        syncManager.refreshLibrary()
+    }
+
+    // MARK: - Calendar meeting link
+
+    /// Link a recording to a calendar meeting the user picked by hand.
+    ///
+    /// Marks the link user-confirmed (`Recording.calendarLinkConfirmed`) so
+    /// `AutoOrganizer` never re-guesses it on a re-transcribe, then mirrors the
+    /// automatic path: it records the event's title and attendees, names an
+    /// untitled recording after the meeting (part-numbered against the library),
+    /// joins a recurring meeting's series, and adopts the event's location when
+    /// geotagging is on and nothing better is already stored.
+    func linkCalendarEvent(_ event: CandidateEvent, on recording: Recording) {
+        let eventTitle = event.title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // A recurring meeting is a series; group this session with the rest.
+        // Resolved before the write because creating the series is its own write.
+        var seriesId = recording.seriesId
+        if let key = event.seriesKey, !eventTitle.isEmpty,
+           let series = MeetingSeriesStore.shared.ensureSeries(calendarKey: key, name: eventTitle) {
+            seriesId = series.id
+        }
+
+        let existingTitles = RecordingStore.shared.recordings
+            .filter { $0.id != recording.id }
+            .map(\.title)
+
+        RecordingStore.shared.update(id: recording.id) { rec in
+            rec.calendarLinkConfirmed = true
+            rec.calendarEventTitle = eventTitle.isEmpty ? nil : eventTitle
+            rec.calendarAttendees = event.attendees.isEmpty ? nil : event.attendees
+            // A changed series invalidates the "since last time" recap — it was
+            // written against a different history. Same rule as
+            // `MeetingSeriesStore.assign`.
+            if rec.seriesId != seriesId {
+                rec.seriesId = seriesId
+                rec.seriesRecap = nil
+            }
+            // Name it after the meeting only when the user hasn't titled it —
+            // the same rule the automatic path follows.
+            if !eventTitle.isEmpty,
+               RecordingTitleSelection.isUntitled(rec.title, placeholder: Recording.untitled) {
+                rec.title = RecordingTitleSelection.numbered(eventTitle, existingTitles: existingTitles)
+            }
+            if DeliverySettings.shared.geotagRecordings, let place = event.place,
+               rec.place?.shouldBeReplaced(by: place) ?? true {
+                rec.place = place
+            }
+        }
+        syncManager.refreshLibrary()
+    }
+
+    /// Clear a recording's calendar meeting link and remember the user did so,
+    /// so `AutoOrganizer` doesn't re-link it on the next pass.
+    ///
+    /// The recording keeps its title (there's no former title to restore) and
+    /// its series (managed separately, from the Meeting-series screen). Only the
+    /// meeting association itself is removed.
+    func unlinkCalendarEvent(from recording: Recording) {
+        RecordingStore.shared.update(id: recording.id) { rec in
+            rec.calendarLinkConfirmed = true
+            rec.calendarEventTitle = nil
+            rec.calendarAttendees = nil
+        }
         syncManager.refreshLibrary()
     }
 
@@ -617,6 +682,61 @@ final class AppModel {
             rec.actionItems = list
         }
         syncManager.refreshLibrary()
+    }
+
+    // MARK: - Pushing tasks to destinations
+
+    /// Whether at least one task destination is switched on.
+    ///
+    /// Reads the **live** enable flag each destination actually gates its writes
+    /// on, not `TaskDestinations.enabled`: the calendar writer owns its own flag
+    /// (`TaskCalendarWriter.writeEnabled`) and `TaskDestinations.calendarEnabled`
+    /// is a disconnected legacy key nothing in the delivery path reads, so trusting
+    /// it would report the calendar as off even when the user has turned it on. The
+    /// Tasks UI uses this to nudge the user to Settings before a send that would
+    /// reach nowhere.
+    var hasEnabledTaskDestination: Bool {
+        RemindersSync.shared.syncEnabled
+            || TaskCalendarWriter.shared.writeEnabled
+            || TaskDestinations.shared.webhookEnabled
+    }
+
+    /// The explicit "send" that replaces the old auto-add.
+    ///
+    /// Extraction only ever *proposes* action items into the Tasks tab; nothing is
+    /// written to Apple Reminders, Calendar, or a webhook until the user pushes it
+    /// here. Pushing sets `pushRequested` on each item — the gate every
+    /// reconciliation planner and the task webhook honour — and then runs the same
+    /// delivery pass `handleForeground` uses, so approved tasks flow to whatever
+    /// destinations are currently enabled (and to any enabled later).
+    ///
+    /// Idempotent: pushing an already-pushed task just re-runs a delivery pass that
+    /// finds nothing new to do.
+    func pushActionItems(_ items: [ActionItem], in recording: Recording) async {
+        let ids = Set(items.map(\.id))
+        guard !ids.isEmpty else { return }
+        RecordingStore.shared.update(id: recording.id) { rec in
+            guard var list = rec.actionItems else { return }
+            for index in list.indices where ids.contains(list[index].id) {
+                list[index].pushRequested = true
+            }
+            rec.actionItems = list
+        }
+        syncManager.refreshLibrary()
+        await deliverPushedTasks()
+    }
+
+    /// Run every enabled task-destination reconciliation pass.
+    ///
+    /// Shared by `pushActionItems` and `handleForeground`. Each pass is a no-op
+    /// when its destination is off or has nothing to do, and none of them create
+    /// anything for a task the user hasn't pushed — so running this on every
+    /// foreground reconciles completion and dates for already-pushed tasks without
+    /// ever mirroring a candidate behind the user's back.
+    func deliverPushedTasks() async {
+        await syncReminders()
+        await syncTaskCalendar()
+        await sendTaskWebhooks()
     }
 
     /// Add or remove a tag on one recording.

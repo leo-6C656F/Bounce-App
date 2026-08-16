@@ -10,10 +10,17 @@ import Foundation
 /// `tools/reminders-sync-tests/main.swift`, which compiles this file and the real
 /// `ActionItem` from `ActionItemMerge.swift` — no stubs.
 ///
-/// ## The sync is one-way, with a completion read-back
+/// ## Creation is explicit; the rest is one-way with a completion read-back
 ///
-/// Bounce is authoritative for everything about a task **except whether it has
-/// been ticked**. Full two-way sync needs conflict resolution for every field
+/// Nothing is mirrored into Reminders automatically. Extraction only *proposes*
+/// action items; a reminder is created for one **only after the user pushes it**,
+/// which sets `ActionItem.pushRequested`. `plan` refuses to create a reminder for
+/// an item whose flag is false, so a repeated foreground pass never backfills the
+/// user's task list into Reminders behind their back. Everything below concerns a
+/// task that has already been pushed.
+///
+/// Bounce is authoritative for everything about a pushed task **except whether it
+/// has been ticked**. Full two-way sync needs conflict resolution for every field
 /// plus deletion detection in both directions, and every one of those decisions
 /// has a wrong answer that silently loses a user's edit. So, per field:
 ///
@@ -145,17 +152,23 @@ enum ReminderPlanning {
 
         for item in items {
             guard let reminderId = item.reminderId, !reminderId.isEmpty else {
-                // Never pushed. Create one, unless there's nothing to chase or
-                // the user has already thrown its reminder away once.
+                // Never pushed. Create one only when the user has explicitly asked
+                // for this task to go out — and never for something already ticked
+                // off or a reminder the user has thrown away once.
                 //
-                // Already-done items are deliberately **not** created. Pushing a
-                // pre-completed reminder puts nothing in front of the user, and
-                // first-enable on a mature library would dump every historical
-                // finished task into the Reminders app at once. The rule is
-                // stable — `isDone` doesn't change as a result of syncing — so
-                // this stays idempotent, and an item the user unticks later
-                // becomes eligible and is created then.
-                if !item.isDone, !forgotten.contains(item.id) {
+                // `pushRequested` is the gate that makes extraction a *proposal*.
+                // Bounce no longer mirrors tasks into Reminders on its own: an item
+                // is a candidate the user reviews in the Tasks tab, and only the
+                // ones they push flip this flag and get a reminder. Without it, a
+                // foreground pass would silently recreate a reminder for every open
+                // task — the auto-add behaviour this replaces.
+                //
+                // Already-done items are deliberately **not** created even when
+                // pushed. Pushing a pre-completed reminder puts nothing in front of
+                // the user. The rule is stable — `isDone` doesn't change as a result
+                // of syncing — so this stays idempotent, and an item the user
+                // unticks later becomes eligible and is created then.
+                if item.pushRequested, !item.isDone, !forgotten.contains(item.id) {
                     plan.toCreate.append(item)
                 }
                 continue

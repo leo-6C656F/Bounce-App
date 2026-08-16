@@ -18,6 +18,7 @@ struct RecordingDetailView: View {
     @State private var isEditingAudio = false
     @State private var isCorrectingWord = false
     @State private var isPickingSeries = false
+    @State private var isPickingMeeting = false
     @State private var tab: DetailTab = .transcript
     /// Peak envelope for the waveform. Empty until `WaveformCache` has one —
     /// building it is a full decode pass, so the bar draws a flat baseline in
@@ -137,6 +138,9 @@ struct RecordingDetailView: View {
         }
         .sheet(isPresented: $isPickingSeries) {
             SeriesPicker(recording: current)
+        }
+        .sheet(isPresented: $isPickingMeeting) {
+            MeetingPicker(recording: current)
         }
         .sheet(isPresented: $isNamingSpeakers) {
             SpeakerNamesSheet(recording: current)
@@ -258,6 +262,10 @@ struct RecordingDetailView: View {
 
                 Button("Meeting series", systemImage: "repeat") {
                     isPickingSeries = true
+                }
+
+                Button("Link to meeting", systemImage: "calendar") {
+                    isPickingMeeting = true
                 }
 
                 if current.transcript?.hasSpeakers == true {
@@ -412,6 +420,12 @@ struct RecordingDetailView: View {
             // where it happened, and the "since last time" recap is the first
             // thing worth reading on a recurring meeting.
             SeriesCard(recording: current)
+
+            // Which single meeting this recording is of — set automatically when
+            // matching is confident, and linked or corrected by hand here when it
+            // isn't. Above the location for the same reason the series is: what a
+            // recording is comes before where it happened.
+            MeetingCard(recording: current)
 
             PlaceCard(recording: current)
 

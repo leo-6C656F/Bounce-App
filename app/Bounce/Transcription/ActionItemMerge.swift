@@ -85,6 +85,28 @@ struct ActionItem: Codable, Hashable, Identifiable {
     /// delivery is on. Nil when never written, or when the user deleted the event
     /// and the link was dropped rather than recreated.
     var calendarEventId: String?
+    /// Whether the user has explicitly approved this task for delivery to the
+    /// enabled task destinations (Reminders, Calendar, webhook).
+    ///
+    /// **This is what makes a task a candidate until the user acts.** Extraction
+    /// only ever *proposes* action items; nothing is written to Apple Reminders,
+    /// Calendar, or a webhook until the user pushes it, which flips this to true.
+    /// The reconciliation planners (`ReminderPlanning`, `CalendarEventPlanning`)
+    /// and the task webhook all refuse to *create* anything for an item whose flag
+    /// is false — see `ReminderPlanning.plan`. Completion read-back and date
+    /// updates for tasks already pushed are unaffected, because a pushed task has
+    /// this set.
+    ///
+    /// Preserved verbatim across a re-extraction, exactly like `isDone`: the merge
+    /// keeps every existing item wholesale, so a user's decision to push survives
+    /// re-transcription. A freshly extracted item starts false.
+    ///
+    /// Decoded with `decodeIfPresent ?? false` (see the `Decodable` extension
+    /// below) for the usual library decode-compat reason: a library written before
+    /// this field existed has no key for it, and a plain `Bool` would fail the
+    /// whole decode. A false default is the safe one — an upgrade never
+    /// retroactively pushes tasks the user never approved.
+    var pushRequested: Bool
 
     init(
         id: String = UUID().uuidString,
@@ -96,7 +118,8 @@ struct ActionItem: Codable, Hashable, Identifiable {
         sourceOffset: TimeInterval? = nil,
         dueDate: Date? = nil,
         reminderId: String? = nil,
-        calendarEventId: String? = nil
+        calendarEventId: String? = nil,
+        pushRequested: Bool = false
     ) {
         self.id = id
         self.text = text
@@ -108,6 +131,29 @@ struct ActionItem: Codable, Hashable, Identifiable {
         self.dueDate = dueDate
         self.reminderId = reminderId
         self.calendarEventId = calendarEventId
+        self.pushRequested = pushRequested
+    }
+}
+
+/// Custom decode kept in an extension so the memberwise-style `init` above — the
+/// one every test harness and call site constructs `ActionItem` through — is not
+/// suppressed. `encode(to:)` stays synthesised, so a freshly written library
+/// always carries the key; only *reading* an older one needs the fallback.
+extension ActionItem {
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        text = try container.decode(String.self, forKey: .text)
+        owner = try container.decodeIfPresent(String.self, forKey: .owner)
+        dueText = try container.decodeIfPresent(String.self, forKey: .dueText)
+        isDone = try container.decode(Bool.self, forKey: .isDone)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        sourceOffset = try container.decodeIfPresent(TimeInterval.self, forKey: .sourceOffset)
+        dueDate = try container.decodeIfPresent(Date.self, forKey: .dueDate)
+        reminderId = try container.decodeIfPresent(String.self, forKey: .reminderId)
+        calendarEventId = try container.decodeIfPresent(String.self, forKey: .calendarEventId)
+        // The one field that has to tolerate an absent key.
+        pushRequested = try container.decodeIfPresent(Bool.self, forKey: .pushRequested) ?? false
     }
 
     /// Owner and deadline as one subtitle line, or nil when neither is known.

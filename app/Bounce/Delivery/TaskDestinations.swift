@@ -440,13 +440,21 @@ enum TaskWebhook {
     /// `ActionItemMerge.merged` applies — a task with no letters or digits in it
     /// isn't a task), and duplicate ids within one batch.
     ///
-    /// Completed items are **not** filtered. A task the user ticked before the
-    /// first send still gets sent, carrying `is_done: true`; whether that becomes
-    /// a closed ticket or nothing at all is the receiver's call, and silently
-    /// dropping it would mean a task that existed left no trace anywhere.
+    /// **Only tasks the user has pushed are sent.** `pushRequested` is the same
+    /// gate the Reminders and Calendar planners apply: extraction proposes tasks,
+    /// and a task webhook is a write into someone else's system, so nothing goes
+    /// out until the user explicitly pushes the task. An un-pushed candidate is
+    /// dropped here rather than at each call site, so every webhook path inherits
+    /// the rule.
+    ///
+    /// Completed items are **not** filtered. A pushed task the user ticked before
+    /// the first send still gets sent, carrying `is_done: true`; whether that
+    /// becomes a closed ticket or nothing at all is the receiver's call, and
+    /// silently dropping it would mean a task that existed left no trace anywhere.
     static func unsent(_ items: [ActionItem], alreadySent: Set<String>) -> [ActionItem] {
         var seen = Set<String>()
         return items.filter { item in
+            guard item.pushRequested else { return false }
             guard !alreadySent.contains(item.id) else { return false }
             guard !ActionItemMerge.normalisedKey(item.text).isEmpty else { return false }
             return seen.insert(item.id).inserted
@@ -598,14 +606,16 @@ enum TaskWebhook {
 
     static func iso8601(_ date: Date) -> String { isoFormatter.string(from: date) }
 
-    /// The task's resolved deadline, once `ActionItem` has one.
+    /// The task's resolved deadline.
     ///
-    /// **One-line change when the AI due-date workstream lands:** return
-    /// `item.dueDate`. Everything downstream of it — the `due_date` key, the
-    /// omit-when-absent rule, the ISO-8601 shape — is already built and covered by
-    /// `tools/task-destinations-tests/main.swift` through the explicit-`dueDate`
-    /// overload of `payload(for:in:dueDate:)`.
+    /// `ActionItem.dueDate` is the deadline `DueDateResolver` validated from the
+    /// spoken phrase — nil unless a real date was stated and survived validation,
+    /// so a fabricated or implausible date never reaches the payload. Everything
+    /// downstream of it — the `due_date` key, the omit-when-absent rule, the
+    /// ISO-8601 shape — is covered by `tools/task-destinations-tests/main.swift`,
+    /// both through this accessor and the explicit-`dueDate` overload of
+    /// `payload(for:in:dueDate:)`.
     private static func resolvedDueDate(of item: ActionItem) -> Date? {
-        nil
+        item.dueDate
     }
 }

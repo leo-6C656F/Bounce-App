@@ -31,6 +31,8 @@ struct TasksView: View {
     @State private var draftText = ""
     /// Which recording a hand-added item belongs to.
     @State private var addTarget: Recording?
+    /// Shown when the user tries to send a task with no destination switched on.
+    @State private var isShowingNoDestinationHint = false
 
     private var transcribedRecordings: [Recording] {
         model.recordings.filter(\.isTranscribed)
@@ -55,7 +57,29 @@ struct TasksView: View {
             } message: {
                 Text(addTarget.map { "Added to “\($0.displayTitle)”." } ?? "")
             }
+            .alert("No destination turned on", isPresented: $isShowingNoDestinationHint) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("Turn on Apple Reminders, Apple Calendar, or a task webhook in Settings › Integrations & Delivery, then send the task again.")
+            }
         }
+    }
+
+    /// Send tasks to whatever destinations are enabled, or nudge to Settings when
+    /// none are.
+    ///
+    /// The gesture that replaces the old auto-add: a task is a proposal until the
+    /// user sends it. When nothing is enabled the approval is deliberately *not*
+    /// recorded — a task shown as "Sent" that reached nowhere would be a lie — so
+    /// the user is pointed at Settings and can send again once a destination is on.
+    private func send(_ items: [ActionItem], in recording: Recording) {
+        let sendable = items.filter { !$0.isDone && !$0.pushRequested }
+        guard !sendable.isEmpty else { return }
+        guard model.hasEnabledTaskDestination else {
+            isShowingNoDestinationHint = true
+            return
+        }
+        Task { await model.pushActionItems(sendable, in: recording) }
     }
 
     // MARK: - Chrome
@@ -175,6 +199,15 @@ struct TasksView: View {
                             Button("Delete", systemImage: "trash", role: .destructive) {
                                 model.deleteActionItem(item, in: group.recording)
                             }
+                            // Only an open task that hasn't been sent yet can be
+                            // sent — a done one has nothing to chase, and a sent one
+                            // is already linked and reconciled on its own.
+                            if !item.isDone, !item.pushRequested {
+                                Button("Send", systemImage: "paperplane") {
+                                    send([item], in: group.recording)
+                                }
+                                .tint(.blue)
+                            }
                         }
                         .swipeActions(edge: .leading) {
                             Button(item.isDone ? "Reopen" : "Done", systemImage: item.isDone ? "arrow.uturn.backward" : "checkmark") {
@@ -214,10 +247,34 @@ struct TasksView: View {
             if group.total > 0, group.done > 0 {
                 StatusChip(text: "\(group.done)/\(group.total)", tint: .accentColor)
             }
+
+            // Send every open, not-yet-sent task in this recording at once. Hidden
+            // in the Done filter, where the sendable tasks aren't even on screen.
+            let sendable = sendableItems(in: group.recording)
+            if filterMode != .completed, !sendable.isEmpty {
+                Button {
+                    send(sendable, in: group.recording)
+                } label: {
+                    Label(
+                        sendable.count == 1 ? "Send" : "Send \(sendable.count)",
+                        systemImage: "paperplane")
+                        .font(.caption.weight(.semibold))
+                        .textCase(nil)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Send \(sendable.count) task\(sendable.count == 1 ? "" : "s") from \(group.recording.displayTitle)")
+            }
         }
         .textCase(nil)
         .padding(.vertical, 4)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// The open, not-yet-sent tasks on a recording — what "Send all" acts on.
+    /// Computed over the full list, not the filtered slice, so the count is the
+    /// recording's real backlog rather than what a search happens to show.
+    private func sendableItems(in recording: Recording) -> [ActionItem] {
+        (recording.actionItems ?? []).filter { !$0.isDone && !$0.pushRequested }
     }
 
     private func row(_ item: ActionItem, in recording: Recording) -> some View {
@@ -253,6 +310,16 @@ struct TasksView: View {
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.tint)
                             .accessibilityLabel("said at \(offset.spokenTimecode)")
+                    }
+                    // Once a task has been sent it carries this badge, so the list
+                    // distinguishes candidates the user still has to review from the
+                    // ones already on their way to Reminders/Calendar/a webhook.
+                    if item.pushRequested {
+                        Label("Sent", systemImage: "paperplane.fill")
+                            .labelStyle(.titleAndIcon)
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.blue)
+                            .accessibilityLabel("Sent to your task destinations")
                     }
                 }
             }

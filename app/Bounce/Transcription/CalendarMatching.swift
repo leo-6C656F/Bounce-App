@@ -106,7 +106,46 @@ enum CalendarMatching {
 
     /// The recorder's clock and the phone's disagree, and people hit record on
     /// the way into the room rather than on the hour. ±5 minutes absorbs both.
+    ///
+    /// **This is the app's known weak spot.** The recording's timestamp is the
+    /// *recorder's* clock (`Recording.createdAt` is derived from the Plaud
+    /// session id), which drifts from the phone. When the drift exceeds this
+    /// tolerance nothing overlaps and matching finds nothing — the documented
+    /// reason auto-linking "usually fails" — which is exactly why the manual
+    /// picker exists to recover it rather than the tolerance being widened
+    /// blindly (that would mis-assign back-to-back meetings).
     static let defaultTolerance: TimeInterval = 300
+
+    /// How sure `evaluate` is that a recording belongs to the event it matched.
+    ///
+    /// The split is the whole point of the feature: a `high` match is safe to
+    /// link (and name) automatically, while a `low` one is only a suggestion —
+    /// the UI surfaces the manual picker rather than committing a guess.
+    enum MatchConfidence: Equatable {
+        /// One eligible event clearly stands out and the recording plainly
+        /// belongs to it — link it without asking.
+        case high
+        /// An event is near enough to offer, but a short recording, a thin
+        /// overlap, or a competing event means we should ask rather than guess.
+        case low
+    }
+
+    /// A recording this short is a note, not a meeting recording, so no match is
+    /// ever confident. Mirrors `RecordingTitleSelection.minimumCalendarRecordingDuration`
+    /// on purpose — duplicated rather than referenced because this file must
+    /// compile standalone under `tools/calendar-match-tests/`.
+    static let confidentMinimumDuration: TimeInterval = 60
+
+    /// A confident match must overlap at least this fraction of the event, so a
+    /// brief aside dropped into a three-hour block isn't confidently claimed.
+    /// Mirrors `RecordingTitleSelection.minimumCalendarCoverage`.
+    static let confidentMinimumCoverage: Double = 0.10
+
+    /// When a second event also contains the recording's start and overlaps at
+    /// least this fraction of what the winner does, the two are close enough to
+    /// be a genuine ambiguity — a double-booking or back-to-back pair — and the
+    /// match drops to `.low` so the user picks.
+    static let ambiguityOverlapRatio: Double = 0.5
 
     /// The event a recording most likely belongs to, or nil.
     ///
@@ -136,6 +175,24 @@ enum CalendarMatching {
         among candidates: [CandidateEvent],
         tolerance: TimeInterval = defaultTolerance
     ) -> CandidateEvent? {
+        evaluate(
+            for: recordingStart, duration: duration,
+            among: candidates, tolerance: tolerance)?.event
+    }
+
+    /// The best match *and* how confident we are in it, or nil when nothing is
+    /// eligible.
+    ///
+    /// The event returned is exactly what `bestMatch` returns — this is that
+    /// same ranking, with the runner-up kept so ambiguity can be judged. The
+    /// confidence is what lets a caller link automatically only when sure and
+    /// fall back to a manual picker otherwise; see `MatchConfidence`.
+    static func evaluate(
+        for recordingStart: Date,
+        duration: TimeInterval,
+        among candidates: [CandidateEvent],
+        tolerance: TimeInterval = defaultTolerance
+    ) -> (event: CandidateEvent, confidence: MatchConfidence)? {
         // A still-recording row has duration 0; a corrupt one could be negative.
         // Both collapse to an instant rather than an inverted interval.
         let span = max(0, duration)
@@ -144,7 +201,7 @@ enum CalendarMatching {
         let windowStart = recordingStart.addingTimeInterval(-tolerance)
         let windowEnd = recordingEnd.addingTimeInterval(tolerance)
 
-        var best: Ranked?
+        var ranked: [Ranked] = []
         for candidate in candidates {
             guard !candidate.isAllDay else { continue }
             guard !candidate.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -175,14 +232,51 @@ enum CalendarMatching {
             let containsStart = candidate.start.addingTimeInterval(-tolerance) <= recordingStart
                 && recordingStart < end
 
-            let ranked = Ranked(
+            ranked.append(Ranked(
                 event: candidate,
                 containsStart: containsStart,
                 overlap: overlap,
-                startGap: abs(candidate.start.timeIntervalSince(recordingStart)))
-            if best == nil || ranked.beats(best!) { best = ranked }
+                startGap: abs(candidate.start.timeIntervalSince(recordingStart))))
         }
-        return best?.event
+
+        // `beats` is a total order (its final tie-breakers are the title), so the
+        // sort is deterministic and the head is the same winner the old
+        // accumulate-the-best loop produced.
+        let sorted = ranked.sorted { $0.beats($1) }
+        guard let best = sorted.first else { return nil }
+        let confidence = confidence(
+            best: best, runnerUp: sorted.dropFirst().first, recordingSpan: span)
+        return (best.event, confidence)
+    }
+
+    /// Whether the winning match is safe to act on without asking.
+    ///
+    /// High only when the recording is long enough to be a meeting, began inside
+    /// the event, covers a real fraction of it, and no second event is a
+    /// plausible rival. Any of those failing means "offer it, don't commit it".
+    private static func confidence(
+        best: Ranked, runnerUp: Ranked?, recordingSpan: TimeInterval
+    ) -> MatchConfidence {
+        guard recordingSpan >= confidentMinimumDuration else { return .low }
+        guard best.containsStart else { return .low }
+        guard coverageOfEvent(best) >= confidentMinimumCoverage else { return .low }
+        // A genuine ambiguity: another event also contains the start and overlaps
+        // comparably. Double-booked, or two adjacent meetings the recording
+        // straddles — either way the machine shouldn't pick for the user.
+        if let runnerUp, runnerUp.containsStart,
+           runnerUp.overlap >= best.overlap * ambiguityOverlapRatio {
+            return .low
+        }
+        return .high
+    }
+
+    /// The fraction of the event the recording overlaps, `0...1`. A zero-length
+    /// event scores 1: there is no coherent sense in which a recording is a
+    /// "fragment" of an instant, so the duration floor alone judges it.
+    private static func coverageOfEvent(_ ranked: Ranked) -> Double {
+        let eventDuration = ranked.event.duration
+        guard eventDuration > 0 else { return 1 }
+        return min(1, ranked.overlap / eventDuration)
     }
 
     /// One eligible candidate with its scores, and the precedence between two of

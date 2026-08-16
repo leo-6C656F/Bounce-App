@@ -382,6 +382,21 @@ struct Recording: Identifiable, Codable, Hashable {
     /// toggle — that payload's shape is a contract for whatever the user has wired
     /// downstream.
     var calendarAttendees: [String]?
+    /// Whether the user has taken manual control of this recording's calendar
+    /// meeting link — by picking a meeting, or by clearing one — via the detail
+    /// view's Meeting card.
+    ///
+    /// **The stickiness guarantee.** When true, `AutoOrganizer` must never write
+    /// any calendar-derived field (`calendarEventTitle`, `calendarAttendees`, a
+    /// calendar-sourced `seriesId` or `place`, or a calendar-sourced title): the
+    /// user's choice outranks whatever a re-transcribe would match, so a manual
+    /// link — or a deliberate unlink — survives every later pass. Without it a
+    /// re-transcribe silently re-guessed the link, which is why a correct manual
+    /// pick previously didn't stick.
+    ///
+    /// Optional for the usual decode-compat reason; `nil` and `false` both mean
+    /// "auto is free to fill this in".
+    var calendarLinkConfirmed: Bool?
     /// The meeting agenda the user typed for this recording, if any.
     ///
     /// Optional for the same reason as every other field added after v1 — see
@@ -476,7 +491,7 @@ struct Recording: Identifiable, Codable, Hashable {
         case id, sessionId, deviceSN, title, duration, createdAt, syncedAt
         case audioFilename, transcript, livePreview, highlights, summaries
         case speakerNames, categoryName, actionItems, tagIds
-        case calendarEventTitle, calendarAttendees, agenda, place
+        case calendarEventTitle, calendarAttendees, calendarLinkConfirmed, agenda, place
         case chapters, seriesId, seriesRecap, parts
         case deliveredToRaw = "deliveredTo"
     }
@@ -505,6 +520,7 @@ struct Recording: Identifiable, Codable, Hashable {
         tagIds: [String]? = nil,
         calendarEventTitle: String? = nil,
         calendarAttendees: [String]? = nil,
+        calendarLinkConfirmed: Bool? = nil,
         agenda: MeetingAgenda? = nil,
         place: RecordingPlace? = nil,
         chapters: [TranscriptChapter]? = nil,
@@ -531,6 +547,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.tagIds = tagIds
         self.calendarEventTitle = calendarEventTitle
         self.calendarAttendees = calendarAttendees
+        self.calendarLinkConfirmed = calendarLinkConfirmed
         self.agenda = agenda
         self.place = place
         self.chapters = chapters

@@ -251,18 +251,18 @@ final class RemindersSync {
                 reminder.calendar = calendar
                 reminder.title = item.text
                 reminder.notes = Self.notes(for: item)
-                // Owner and deadline go in the notes, and the due date is
-                // deliberately left unset. `ActionItem.dueText` is the deadline
-                // exactly as it was spoken — "by Friday", "end of the month",
-                // "before the board meeting" — not a date, on purpose (see the
-                // type's own documentation): the on-device model has no reliable
-                // notion of what today is, so resolving one would be a guess, and
-                // a guessed date is worse than a phrase because a phrase is
-                // obviously approximate while a date looks authoritative. Setting
-                // `dueDateComponents` would also drag in `startDateComponents`,
-                // which iOS requires alongside it or the save fails with
-                // `EKErrorNoStartDate` — a second invented date to prop up the
-                // first.
+                // The spoken deadline (`dueText`) stays in the notes as the
+                // evidence, and when `DueDateResolver` managed to turn it into a
+                // real, validated instant (`dueDate`) that instant is set on the
+                // reminder so it actually alerts.
+                //
+                // This is only safe *because* `dueDate` is validated: it is nil
+                // unless a date was spoken and survived `DueDateResolver`'s hard
+                // checks, so Bounce never fabricates a deadline — an undated task
+                // stays undated in Reminders, exactly as before. The earlier
+                // build set no date at all because there was no trustworthy one to
+                // set; there is now.
+                Self.applyDueDate(item.dueDate, to: reminder)
                 guard (try? store.save(reminder, commit: false)) != nil else { continue }
                 pending.append((item.id, reminder))
                 didWrite = true
@@ -348,6 +348,27 @@ final class RemindersSync {
     /// so no `EKReminder` ever crosses an actor boundary.
     private func reminder(withIdentifier identifier: String) -> EKReminder? {
         store.calendarItem(withIdentifier: identifier) as? EKReminder
+    }
+
+    /// Set a validated deadline on a freshly built reminder, or leave it undated.
+    ///
+    /// A no-op for a nil `dueDate`, so an undated task creates an undated reminder
+    /// exactly as before — the caller passes `item.dueDate` straight through, and
+    /// that is nil unless `DueDateResolver` validated a spoken deadline.
+    ///
+    /// `dueDateComponents` carries the day *and* the time of day (9am by default,
+    /// or the spoken hour — `DueDateResolver.defaultHour`), which is what makes the
+    /// reminder a timed one that alerts rather than a silent all-day entry. An
+    /// **absolute** `EKAlarm` is added on the same instant to guarantee the
+    /// notification fires: an absolute alarm is anchored to a concrete date and so
+    /// needs no `startDateComponents`, sidestepping the `EKErrorNoStartDate` a
+    /// relative alarm would demand one for. Only ever a date the resolver produced,
+    /// never a fabricated one.
+    private static func applyDueDate(_ dueDate: Date?, to reminder: EKReminder) {
+        guard let dueDate else { return }
+        reminder.dueDateComponents = Calendar.current.dateComponents(
+            [.year, .month, .day, .hour, .minute], from: dueDate)
+        reminder.addAlarm(EKAlarm(absoluteDate: dueDate))
     }
 
     /// Owner and deadline as the reminder's notes, or nil when neither is known.

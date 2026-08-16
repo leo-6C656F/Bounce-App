@@ -160,7 +160,7 @@ struct IntegrationsSettingsView: View {
         } footer: {
             Text(taskCalendarDenied
                  ? "Calendar write access disabled. Grant access in iOS Settings › Privacy & Security › Calendars › Bounce."
-                 : "Action items with specific deadlines are added as calendar events. Bounce only manages events it created and never modifies your personal events.")
+                 : "Tasks you send from the Tasks tab that have a specific deadline are added as calendar events — nothing is added automatically. Bounce only manages events it created and never modifies your personal events.")
         }
     }
 
@@ -214,7 +214,7 @@ struct IntegrationsSettingsView: View {
         } footer: {
             Text(remindersDenied
                  ? "Reminders access disabled. Grant access in iOS Settings › Privacy & Security › Reminders › Bounce."
-                 : "Extracted action items are synced to Apple Reminders. Completing a task in either app updates the status in both.")
+                 : "Bounce never adds tasks to Reminders on its own. Review the action items in the Tasks tab and tap Send on the ones you want — those, and only those, are added here, with their due date when one was mentioned. Completing a task in either app updates the status in both.")
         }
     }
 
@@ -309,7 +309,7 @@ struct IntegrationsSettingsView: View {
             Text("Task Webhook")
         } footer: {
             if destinations.webhookEnabled {
-                Text("Sends individual action item JSON objects to external task services like Todoist, Linear, Notion, or custom endpoints. Full transcript audio is not sent.")
+                Text("Sends the action items you send from the Tasks tab to external task services like Todoist, Linear, Notion, or custom endpoints as individual JSON objects — nothing is sent automatically. Full transcript audio is not sent.")
             }
         }
     }

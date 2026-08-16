@@ -98,6 +98,56 @@ final class CalendarMatcher {
             tolerance: tolerance)
     }
 
+    /// The best match together with how confident it is, or nil. The confidence
+    /// is what lets a caller link automatically only when sure and otherwise
+    /// fall back to the manual picker — see `CalendarMatching.MatchConfidence`.
+    func evaluate(
+        recordingStart: Date,
+        duration: TimeInterval,
+        tolerance: TimeInterval = CalendarMatching.defaultTolerance
+    ) -> (event: CandidateEvent, confidence: CalendarMatching.MatchConfidence)? {
+        CalendarMatching.evaluate(
+            for: recordingStart,
+            duration: duration,
+            among: candidates(recordingStart: recordingStart, duration: duration, tolerance: tolerance),
+            tolerance: tolerance)
+    }
+
+    /// How far either side of the recording the manual picker looks for meetings
+    /// to offer. Deliberately wide — the whole point of the picker is to catch
+    /// the cases automatic matching missed (a drifted recorder clock, a meeting
+    /// that ran long or started early), so it shows the surrounding few hours,
+    /// not just the ±5-minute matching window.
+    static let pickerWindow: TimeInterval = 3 * 60 * 60
+
+    /// Real meetings around the recording — before, during and after — for the
+    /// manual picker, sorted by start. All-day and blank-titled events are
+    /// dropped for the same reasons `bestMatch` rejects them: they can't be the
+    /// specific meeting the user is linking to.
+    ///
+    /// Silent `[]` on no access, exactly like `candidates`.
+    func surroundingEvents(
+        recordingStart: Date,
+        duration: TimeInterval,
+        window: TimeInterval = CalendarMatcher.pickerWindow
+    ) -> [CandidateEvent] {
+        guard canReadEvents else { return [] }
+        let span = max(0, duration)
+        let window = max(0, window)
+        let from = recordingStart.addingTimeInterval(-window)
+        let to = max(
+            recordingStart.addingTimeInterval(span + window),
+            from.addingTimeInterval(1))
+        let predicate = store.predicateForEvents(withStart: from, end: to, calendars: nil)
+        return store.events(matching: predicate)
+            .compactMap(Self.candidate(from:))
+            .filter {
+                !$0.isAllDay
+                    && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            .sorted { $0.start < $1.start }
+    }
+
     /// Every event near the recording, flattened. Exposed separately so a picker
     /// can offer the near misses rather than only the single best guess.
     func candidates(

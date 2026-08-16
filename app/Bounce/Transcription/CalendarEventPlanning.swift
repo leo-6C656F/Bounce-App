@@ -21,9 +21,12 @@ import Foundation
 /// into an instant. A task whose date is resolved by a later pass becomes eligible
 /// then and gets its event then.
 ///
-/// This is the one substantive difference from `ReminderPlanning`, which pushes
-/// every open task. The two destinations are complementary rather than redundant:
-/// Reminders is the list of everything, Calendar is the subset that has a time.
+/// This is the one substantive difference from `ReminderPlanning`, which creates a
+/// reminder for every open task the user has pushed. The two destinations are
+/// complementary rather than redundant: Reminders is the list of everything the
+/// user pushed, Calendar is the subset of that which has a time. Both only ever
+/// act on a task the user explicitly pushed — see the `pushRequested` gate in
+/// `plan`.
 ///
 /// ## Bounce is authoritative for the date, until the user disagrees
 ///
@@ -293,11 +296,16 @@ enum CalendarEventPlanning {
             let eligible = isEligible(item)
 
             guard let eventId = item.calendarEventId, !eventId.isEmpty else {
-                // Never pushed. An already-done or undated task is simply not
-                // created — same posture as `ReminderPlanning`, and it is what
-                // stops a first enable on a mature library backfilling months of
-                // finished work into the user's calendar.
-                if eligible, !forgotten.contains(item.id) { plan.toCreate.append(task) }
+                // Never pushed. An event is created only when the user has
+                // explicitly pushed the task (`pushRequested`) — extraction merely
+                // proposes tasks; nothing reaches the calendar until the user acts.
+                // An already-done or undated task is still not created even when
+                // pushed — same posture as `ReminderPlanning` — which is what stops
+                // a first enable on a mature library backfilling months of finished
+                // work into the user's calendar.
+                if eligible, item.pushRequested, !forgotten.contains(item.id) {
+                    plan.toCreate.append(task)
+                }
                 continue
             }
 

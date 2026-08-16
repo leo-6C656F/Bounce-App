@@ -443,7 +443,16 @@ Extraction runs **inside `AutoOrganizer.process`, after the template loop** — 
 - **Reading events needs `NSCalendarsFullAccessUsageDescription` and `requestFullAccessToEvents()`.** iOS 17 split calendar authorization; write-only is refused for reads.
 - **`CalendarMatcher` never writes, and never retains an `EKEvent`** — title and attendee display names are extracted and the object dropped. Bounce *can* now write calendar events, but through a separate type (`TaskCalendarWriter`, below); keeping the read path incapable of writing is why they aren't one class.
 - **Attendee names are personal data.** They live in `library.json`, are never logged, and must not join the webhook payload without a settings toggle, since that payload's shape is a contract for whatever the user wired downstream.
-- `AutoOrganizer` runs the match *before* classification and uses the event title only when the recording is still untitled. When a calendar title is taken, the AI title is skipped but the category is still assigned — `applyCalendarMatch` returns whether it retitled, precisely so those two decisions stay separate.
+- `AutoOrganizer` runs the match *before* classification and uses the event title only when the recording is still untitled (via `RecordingTitleSelection.select`). When a calendar title is taken, the AI title is skipped but the category is still assigned — the lookup and the naming decision are separate types precisely so those two decisions stay independent.
+
+### Confidence, and the manual picker
+
+The recording's timestamp is the *recorder's* clock (`Recording.createdAt` derives from the Plaud session id), which drifts from the phone. When the drift exceeds the ±5 min tolerance nothing overlaps and matching finds nothing — the documented reason automatic linking was unreliable. Rather than guess a clock offset (which would mis-assign back-to-back meetings), the design leans on confidence plus a manual fallback:
+
+- **`CalendarMatching.evaluate` returns the winner *and* a `MatchConfidence`.** `.high` means safe to link automatically: the recording is long enough to be a meeting (≥ 60 s), began inside the event, covers a real fraction of it (≥ 10 %), and no second event is a plausible rival. Anything weaker is `.low`. `bestMatch` still exists and is `evaluate(...).event` — the ranking is unchanged.
+- **`AutoOrganizer` auto-links only on `.high`.** A `.low` or absent match writes no calendar field and no calendar title, leaving the choice to the user. This is why `.low` matches no longer seed `calendarEventTitle`/`calendarAttendees` automatically.
+- **The picker (`UI/Detail/MeetingCard.swift`) is the fallback.** `CalendarMatcher.surroundingEvents` fetches a wide window (±3 h) so the user can pick the meeting **before, during, or after** the recording. `AppModel.linkCalendarEvent` / `unlinkCalendarEvent` apply the choice.
+- **A hand-set link sticks: `Recording.calendarLinkConfirmed`.** When true, `AutoOrganizer` writes no calendar-derived field on any later pass, so a manual pick — or a deliberate unlink — survives re-transcription. Without it, a re-transcribe silently re-guessed the link, which is why a correct manual pick previously didn't hold.
 
 ## The watch app is a remote for the phone
 
@@ -516,8 +525,11 @@ Things that are load-bearing:
 
 Three destinations, all off by default, all writing into something outside Bounce: Apple Reminders (`RemindersSync`), Apple Calendar (`TaskCalendarWriter`), and a per-task webhook (`TaskWebhook`). Each splits the same way — a pure, tested planning layer and a thin layer that applies the plan — because the reconciliation rules are where the bugs live, not the API calls.
 
+**Nothing is written until the user pushes.** Extraction (`ActionItemExtractor`) only *proposes* action items into the Tasks tab; a task reaches any destination only when the user sends it, which sets `ActionItem.pushRequested`. Every planner and the webhook refuse to *create* anything for a task whose flag is false, so a foreground pass reconciles completion and dates for already-sent tasks without ever mirroring a candidate behind the user's back. `AppModel.pushActionItems` sets the flag and runs the delivery pass; the Tasks tab exposes per-task and per-recording "Send". This replaced an earlier design that auto-mirrored every open task the moment a destination was enabled — which dumped a whole library into Reminders at once and gave the user no review step.
+
 Rules they share, and the reasoning:
 
+- **Create only what the user pushed.** `pushRequested` is the single gate across all three destinations, checked at the create site in each planner (and in `TaskWebhook.unsent`). Completion read-back and date reconciliation for already-pushed tasks are unaffected.
 - **Plan before acting, and treat a failed fetch as different from an empty one.** The planners take the current remote state as the complete truth; `[:]` from a fetch that errored would unlink every synced item at once.
 - **Deleted remotely means unlink, never recreate.** Recreating fights a user who deleted something on purpose.
 - **Idempotent.** These run on every foreground, so re-planning after applying must yield an empty plan.
@@ -536,6 +548,8 @@ Destination-specific decisions worth knowing:
 An earlier version refused to resolve dates at all, on the grounds that "the on-device model has no reliable notion of today". **That reasoning was wrong** — the model doesn't need to know, because `DueDateResolver.instructions(recordedAt:calendar:)` tells it, anchoring on the recording's own date *and weekday* and giving worked examples. The model returns a strict ISO-8601 fragment, which `resolve` validates hard: unparseable, before the recording, or more than two years out all yield nil. A wrong date in someone's Reminders is worse than no date, so validation is what earns the feature.
 
 The anchor is the **recording's** `createdAt`, not the transcript's — those differ whenever transcription runs days later, and using the wrong one shifts every deadline by that gap.
+
+A pushed task carries that resolved `dueDate` all the way through: the webhook emits it as `due_date`, the calendar event is scheduled on it, and a created reminder now gets its `dueDateComponents` set (with an absolute alarm) so it actually alerts — but only ever the validated date, never a fabricated one. When `dueDate` is nil the reminder stays undated, exactly as before.
 
 ## Tags, and why not folders
 
