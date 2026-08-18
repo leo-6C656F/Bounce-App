@@ -5,6 +5,20 @@ struct LibraryView: View {
 
     @Environment(AppModel.self) private var model
     @State private var searchText = ""
+    /// `searchText` lagged by a short debounce, so filtering runs once per typing
+    /// pause instead of once per keystroke (S-8). The text field still binds
+    /// `searchText` for instant echo; only the filter reads this.
+    @State private var debouncedSearch = ""
+    /// The debounce timer for `searchText → debouncedSearch`.
+    @State private var searchDebounce: Task<Void, Never>?
+    /// The filtered library, computed **off the main actor** and published here
+    /// (S-8). `nil` until the first pass lands — the computed `filtered`/`dotDates`
+    /// below fall back to a synchronous pass then, so there is no empty-state
+    /// flash on the frame the tab first appears.
+    @State private var asyncFiltered: [Recording]?
+    /// Dates of everything the non-day filters admit, for the calendar's dots.
+    /// Same off-main pass as `asyncFiltered`; see `countsByDay`.
+    @State private var asyncDotDates: [Date]?
     @State private var filter: Filter = .all
     /// Category *name*, matching `Recording.categoryName`. Nil is "all".
     @State private var categoryFilter: String?
@@ -139,7 +153,130 @@ struct LibraryView: View {
                 await WaveformCache.shared.prewarm(
                     model.recordings.compactMap { RecordingStore.shared.audioURL(for: $0) })
             }
+            // Debounce typing into `debouncedSearch` so the (now off-main) filter
+            // runs once per pause, not once per keystroke. Clearing is instant —
+            // an emptied field should reveal everything without a beat of delay.
+            .onChange(of: searchText) { _, newValue in
+                searchDebounce?.cancel()
+                if newValue.isEmpty {
+                    debouncedSearch = ""
+                } else {
+                    searchDebounce = Task {
+                        try? await Task.sleep(for: .milliseconds(200))
+                        guard !Task.isCancelled else { return }
+                        debouncedSearch = newValue
+                    }
+                }
+            }
+            // Run the filter off the main actor whenever an input changes, and
+            // publish the result into `@State`. Search cost is scanning cached
+            // per-recording haystacks off-main; non-search filter changes still
+            // hop off and back but complete within a frame, so category/tag taps
+            // stay instant.
+            .task(id: filterInputs) {
+                let inputs = filterInputs
+                let recordings = model.recordings
+                let result = await Task.detached(priority: .userInitiated) {
+                    Self.computeFilter(recordings: recordings, inputs: inputs)
+                }.value
+                guard !Task.isCancelled else { return }
+                asyncFiltered = result.filtered
+                asyncDotDates = result.dotDates
+            }
         }
+    }
+
+    // MARK: - Off-main filtering
+
+    /// Everything the filter depends on, gathered so `.task(id:)` re-runs the
+    /// off-main pass exactly when one changes. Uses `debouncedSearch`, not the
+    /// live `searchText`, so a keystroke only triggers a pass after the pause.
+    private struct FilterInputs: Equatable {
+        var search: String
+        var filter: Filter
+        var selectedDay: Date?
+        var category: String?
+        var tags: Set<String>
+        /// A cheap digest of the library, so a synced/transcribed/edited/deleted
+        /// recording re-runs the filter without comparing every transcript.
+        var recordingsToken: Int
+    }
+
+    private var filterInputs: FilterInputs {
+        FilterInputs(
+            search: debouncedSearch,
+            filter: filter,
+            selectedDay: selectedDay,
+            category: categoryFilter,
+            tags: tagFilter,
+            recordingsToken: recordingsToken)
+    }
+
+    /// Hashes only cheap, decisive fields — never transcript text — so it stays
+    /// O(N) over small values. Segment count + `isPreview` + transcript
+    /// `createdAt` move whenever a transcription lands or is replaced, which is
+    /// what a search over transcripts must react to; `searchIdentity` inside the
+    /// haystack cache catches finer in-place edits.
+    private var recordingsToken: Int {
+        var hasher = Hasher()
+        hasher.combine(model.recordings.count)
+        for recording in model.recordings {
+            hasher.combine(recording.id)
+            hasher.combine(recording.title)
+            hasher.combine(recording.categoryName)
+            hasher.combine(recording.tagIds)
+            hasher.combine(recording.createdAt)
+            hasher.combine(recording.transcript?.segments.count ?? 0)
+            hasher.combine(recording.transcript?.isPreview ?? false)
+            hasher.combine(recording.transcript?.createdAt)
+        }
+        return hasher.finalize()
+    }
+
+    /// The filter pipeline, pure and `static` so it runs in a detached task.
+    ///
+    /// Computes the day-agnostic set once (state · category · tags · search) —
+    /// which the calendar dots need in full — then narrows to the selected day
+    /// for the displayed list. Search matches the cheap `displayTitle` first,
+    /// then the cached lowercased transcript haystack (`RecordingSearchIndex`),
+    /// preserving the exact semantics the old synchronous `matching` had.
+    private static func computeFilter(
+        recordings: [Recording],
+        inputs: FilterInputs
+    ) -> (filtered: [Recording], dotDates: [Date]) {
+        let needle = inputs.search.lowercased()
+        let base = recordings.filter { recording in
+            switch inputs.filter {
+            case .all: break
+            case .transcribed: if !recording.isTranscribed { return false }
+            case .pending: if recording.isTranscribed { return false }
+            }
+
+            if let category = inputs.category {
+                // Case-insensitive to match `CategoryStore.category(named:)` and
+                // `AutoOrganizer`, which stores whatever case the model returned.
+                guard let name = recording.categoryName,
+                      name.compare(category, options: .caseInsensitive) == .orderedSame
+                else { return false }
+            }
+
+            // AND, not OR. An empty selection matches everything.
+            guard RecordingTags.matches(recordingTagIds: recording.tagIds, selected: inputs.tags)
+            else { return false }
+
+            guard !needle.isEmpty else { return true }
+            if recording.displayTitle.lowercased().contains(needle) { return true }
+            return RecordingSearchIndex.shared.haystack(for: recording).contains(needle)
+        }
+
+        let dotDates = base.map(\.createdAt)
+
+        guard let day = inputs.selectedDay else { return (base, dotDates) }
+        // `isDate(_:inSameDayAs:)` rather than comparing `startOfDay` values:
+        // calendar-aware, so a day that isn't 24 hours long across a DST change
+        // still matches correctly.
+        let filtered = base.filter { Calendar.current.isDate($0.createdAt, inSameDayAs: day) }
+        return (filtered, dotDates)
     }
 
     @ViewBuilder
@@ -314,7 +451,7 @@ struct LibraryView: View {
     /// would erase every other day's dot and there would be no way to navigate
     /// back.
     private var countsByDay: [Date: Int] {
-        CalendarGrid.countsByDay(for: matching(ignoringSelectedDay: true).map(\.createdAt))
+        CalendarGrid.countsByDay(for: dotDates)
     }
 
     // MARK: - List
@@ -431,46 +568,17 @@ struct LibraryView: View {
         return names.dropLast().joined(separator: ", ") + " and " + last
     }
 
-    private var filtered: [Recording] { matching(ignoringSelectedDay: false) }
+    /// The filtered library. Reads the off-main result once it lands, falling
+    /// back to a synchronous pass on the first frame (and any frame before the
+    /// first async pass returns) so the tab never flashes its empty state.
+    private var filtered: [Recording] {
+        asyncFiltered ?? Self.computeFilter(recordings: model.recordings, inputs: filterInputs).filtered
+    }
 
-    /// The filter pipeline.
-    ///
-    /// `ignoringSelectedDay` exists for the calendar's dots: they are built from
-    /// everything the other filters admit, because a day-scoped count would leave
-    /// exactly one day dotted and no way back to the others.
-    private func matching(ignoringSelectedDay: Bool) -> [Recording] {
-        model.recordings.filter { recording in
-            switch filter {
-            case .all: break
-            case .transcribed: if !recording.isTranscribed { return false }
-            case .pending: if recording.isTranscribed { return false }
-            }
-
-            if !ignoringSelectedDay, let selectedDay {
-                // `isDate(_:inSameDayAs:)` rather than comparing `startOfDay`
-                // values: it's calendar-aware, so a day that isn't 24 hours long
-                // across a DST change still matches correctly.
-                guard Calendar.current.isDate(recording.createdAt, inSameDayAs: selectedDay)
-                else { return false }
-            }
-
-            if let categoryFilter {
-                // Case-insensitive to match `CategoryStore.category(named:)` and
-                // `AutoOrganizer`, which stores whatever case the model returned.
-                guard let name = recording.categoryName,
-                      name.compare(categoryFilter, options: .caseInsensitive) == .orderedSame
-                else { return false }
-            }
-
-            // AND, not OR. An empty selection matches everything.
-            guard RecordingTags.matches(recordingTagIds: recording.tagIds, selected: tagFilter)
-            else { return false }
-
-            guard !searchText.isEmpty else { return true }
-            let needle = searchText.lowercased()
-            if recording.displayTitle.lowercased().contains(needle) { return true }
-            return recording.transcript?.plainText.lowercased().contains(needle) ?? false
-        }
+    /// Dates feeding the calendar dots — the day-agnostic filter set. Same
+    /// off-main source and synchronous fallback as `filtered`.
+    private var dotDates: [Date] {
+        asyncDotDates ?? Self.computeFilter(recordings: model.recordings, inputs: filterInputs).dotDates
     }
 
     /// `RecordingDayGroup` rather than a private type: the timeline and the

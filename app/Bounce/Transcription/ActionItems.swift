@@ -77,7 +77,7 @@ final class ActionItemExtractor {
             instructions: Self.instructions(for: text, recordedAt: recordedAt))
         do {
             let response = try await session.respond(
-                to: "List the action items. Return an empty list if there are none.",
+                to: Self.request(),
                 generating: ExtractedActions.self)
             let items = Self.convert(
                 response.content.items,
@@ -106,17 +106,41 @@ final class ActionItemExtractor {
     /// having lost this id, kept so a missing prompt degrades to shipped behaviour
     /// rather than to an empty instruction.
     private static func instructions(for transcript: String, recordedAt: Date) -> String {
-        let deadlineRules = DueDateResolver.instructions(
-            recordedAt: recordedAt, calendar: .current)
-        let edited = PromptStore.shared.filled(
-            PromptID.actionsExtract,
-            with: [
-                "transcript": cap(transcript),
-                "deadline_rules": deadlineRules,
-            ])
+        let deadlineRules = deadlineRules(recordedAt: recordedAt)
+        let values = [
+            "transcript": cap(transcript),
+            "deadline_rules": deadlineRules,
+        ]
+        let edited = PromptStore.shared.filled(PromptID.actionsExtract, with: values)
         if !edited.isEmpty { return edited }
 
         return fallbackInstructions(for: transcript, deadlineRules: deadlineRules)
+    }
+
+    /// The one-line user turn, with the user's edit applied if they've made one.
+    ///
+    /// Routed through `PromptStore` so Settings › AI › Prompts can edit it; the
+    /// shipped default is the fallback for the impossible case of the catalogue
+    /// having lost this id. `actionsRequest` has no placeholders, so this is a bare
+    /// `text(for:)` rather than a `filled(_:with:)`.
+    private static func request() -> String {
+        let edited = PromptStore.shared.text(for: PromptID.actionsRequest)
+        return edited.isEmpty ? PromptDefaults.actionsRequest : edited
+    }
+
+    /// The `{deadline_rules}` fragment spliced into the extraction prompt, with the
+    /// user's edit applied if they've made one.
+    ///
+    /// `DueDateResolver` stays pure Foundation and never touches `PromptStore`, so
+    /// its caller owns the routing: the editable `dueDateRules` template is filled
+    /// with the date anchors the resolver computes, and the resolver's own literal
+    /// is the fallback for the catalogue-lost-the-id case.
+    private static func deadlineRules(recordedAt: Date) -> String {
+        let values = DueDateResolver.ruleValues(recordedAt: recordedAt, calendar: .current)
+        let edited = PromptStore.shared.filled(PromptID.dueDateRules, with: values)
+        if !edited.isEmpty { return edited }
+
+        return DueDateResolver.instructions(recordedAt: recordedAt, calendar: .current)
     }
 
     private static func fallbackInstructions(

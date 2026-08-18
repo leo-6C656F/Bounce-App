@@ -79,8 +79,22 @@ final class LiveStreamAssembler {
     /// How long to wait before the next decode slice. Streaming keeps the
     /// transcript a few seconds behind the speaker; the whole-file fallback backs
     /// off so its quadratic cost doesn't dominate a long recording.
+    ///
+    /// The streaming path also stretches its cadence as the buffer grows (S-12).
+    /// Even on the streaming path, each slice re-decrypts and re-parses the
+    /// *whole* plaintext from page 0 — `OggOpusParser` assigns page roles by index,
+    /// so a windowed parse silently loses the stream config (see CLAUDE.md and
+    /// `LiveDecoder.decodeStreaming`), which rules out true incremental parsing.
+    /// So per-slice cost grows with recording length and a fixed 3 s cadence makes
+    /// the total O(n²): sustained CPU/thermal/battery, and a ~2× transient
+    /// allocation on every tick. Easing the interval from 3 s toward the 8 s cap as
+    /// the buffer passes a few MB keeps that residual cost a small fraction of
+    /// wall-clock on a long recording while staying near real-time early on.
     var suggestedSliceInterval: Duration {
-        lastDecodePath == .wholeFile ? .seconds(8) : .seconds(3)
+        if lastDecodePath == .wholeFile { return .seconds(8) }
+        let megabytes = Double(receivedBytes) / (1024 * 1024)
+        let seconds = min(8.0, 3.0 + megabytes * 0.6)
+        return .seconds(seconds)
     }
 
     /// Private key for the RSA unwrap, fetched once on the main actor and handed
@@ -129,6 +143,14 @@ final class LiveStreamAssembler {
     /// How far behind our cursor a re-send has to start before it counts as "some
     /// other read owns the channel" rather than ordinary overlap.
     private static let resendSlack = 65_536
+
+    /// Largest forward gap `write` will zero-fill in one step. `bleData` offsets
+    /// come straight off the device, so a corrupt or rogue packet claiming a huge
+    /// offset would otherwise zero-fill an arbitrarily large buffer — a
+    /// memory-pressure crash driven by untrusted input (S-16). A genuine hole in
+    /// the stream is packet-scale (hundreds of bytes to a few KB); a jump past 8 MB
+    /// is not a gap, it is a bad offset, and the packet is dropped.
+    private static let maxForwardGap = 8 * 1024 * 1024
 
     /// Serialises work sent to the decoder actor. Unstructured `Task`s have **no
     /// ordering guarantee** between them, so `reset()` and `restoreCursor` fired as
@@ -281,10 +303,25 @@ final class LiveStreamAssembler {
     /// over at 0.
     func resumeStream() {
         guard let sessionId else { return }
+
+        // A resume re-opens the stream, so hand the read-request budget back.
+        // `maxReadRequests` exists to stop us pestering a firmware that refuses
+        // *within one streaming attempt* — but it is a whole-recording total that
+        // the initial channel-contention retries (`requesting stream … attempt 1
+        // of 3`, `stream restarted at 0`) typically spend before the first pause.
+        // Left spent, the post-resume `scheduleResumeFallback` → `requestReadFromStart`
+        // becomes a silent no-op and the transcript freezes for the rest of the
+        // call even though the recorder keeps recording. Resetting here keeps the
+        // fallback-from-zero reachable every time the stream is re-opened, which
+        // is what guarantees the stream re-establishes even if the firmware
+        // ignores a non-zero `start` offset.
+        readRequests = 0
+
         let start = isHeaderReady ? (expectedOffset ?? 0) : 0
         receivedAtLastRequest = receivedBytes
         TranscribeLog.log("assembler: re-requesting stream from \(start) "
-            + "for \(sessionId) after resume")
+            + "for \(sessionId) after resume (read-request budget reset to 0 of "
+            + "\(Self.maxReadRequests))")
         BleAgent.shared.syncFile(sessionId: sessionId, start: start, end: 0, decode: false)
         if start > 0 { scheduleResumeFallback() }
     }
@@ -340,7 +377,9 @@ final class LiveStreamAssembler {
     /// packet, before the hop to the main actor. The gap between it and now is
     /// the main-actor scheduling delay — the Tier-1 measurement.
     func ingest(sessionId: Int, offset: Int, data: Data, callbackAt: ContinuousClock.Instant) {
-        guard sessionId == self.sessionId, !data.isEmpty else { return }
+        // `offset` is untrusted device input; a negative one would crash
+        // `replaceSubrange` below (S-16).
+        guard sessionId == self.sessionId, !data.isEmpty, offset >= 0 else { return }
 
         recordArrival(bytes: data.count, callbackAt: callbackAt)
 
@@ -363,16 +402,25 @@ final class LiveStreamAssembler {
                     resumeStream()
                 }
             } else {
+                let gap = offset - expected
+                // An implausibly large forward jump is a bad offset, not a hole —
+                // zero-filling to it would be an unbounded allocation from
+                // untrusted input (S-16). Drop the packet and keep the cursor.
+                if gap > Self.maxForwardGap {
+                    TranscribeLog.log("assembler: ✗ implausible \(gap)-byte forward gap "
+                        + "at \(expected) — dropping packet at offset \(offset)")
+                    return
+                }
                 // Ogg is self-synchronising, so the parser resyncs at the next page
                 // boundary and only the damaged pages are lost. The zeros left in
                 // the hole keep every later byte at its true offset.
-                holeBytes += offset - expected
-                TranscribeLog.log("assembler: ⚠︎ \(offset - expected)-byte gap at "
+                holeBytes += gap
+                TranscribeLog.log("assembler: ⚠︎ \(gap)-byte gap at "
                     + "\(expected), left as silence (total \(holeBytes))")
             }
         }
 
-        write(offset: offset, data: data)
+        guard write(offset: offset, data: data) else { return }
         expectedOffset = offset + data.count
 
         checkHeader()
@@ -415,13 +463,25 @@ final class LiveStreamAssembler {
     }
 
     /// Write at an absolute offset, growing the buffer with zeros as needed.
-    private func write(offset: Int, data: Data) {
+    ///
+    /// Returns `false` and writes nothing when the packet would grow the buffer by
+    /// more than `maxForwardGap` — the choke point for the untrusted-offset guard
+    /// (S-16). This also covers the very first packet, where `ingest` has no
+    /// `expectedOffset` to gap-check against yet.
+    @discardableResult
+    private func write(offset: Int, data: Data) -> Bool {
         let end = offset + data.count
         if file.count < end {
+            guard end - file.count <= Self.maxForwardGap else {
+                TranscribeLog.log("assembler: ✗ dropping packet at \(offset): "
+                    + "would grow buffer by \(end - file.count) bytes past \(file.count)")
+                return false
+            }
             file.append(Data(count: end - file.count))
         }
         file.replaceSubrange(offset..<end, with: data)
         receivedBytes += data.count
+        return true
     }
 
     /// Promote to header-ready the moment 0…1023 are genuinely present.

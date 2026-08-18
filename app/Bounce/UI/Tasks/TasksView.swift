@@ -62,6 +62,20 @@ struct TasksView: View {
             } message: {
                 Text("Turn on Apple Reminders, Apple Calendar, or a task webhook in Settings › Integrations & Delivery, then send the task again.")
             }
+            // The outcome of an explicit Send to Reminders — a plain confirmation
+            // ("Added N to Reminders") or a clear failure with what to do about it.
+            // Replaces the old silent no-op when the target list had been deleted.
+            .alert(
+                model.taskSendResult?.title ?? "",
+                isPresented: Binding(
+                    get: { model.taskSendResult != nil },
+                    set: { if !$0 { model.taskSendResult = nil } }),
+                presenting: model.taskSendResult
+            ) { _ in
+                Button("OK", role: .cancel) {}
+            } message: { result in
+                Text(result.body)
+            }
         }
     }
 

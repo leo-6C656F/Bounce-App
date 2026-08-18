@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// Local persistence: recording metadata in a JSON file, device pairing in UserDefaults.
 ///
@@ -6,6 +7,37 @@ import Foundation
 /// invariant it protects: `audioFilename` is a bare filename, never an
 /// absolute path, because the sandbox container path is not stable across
 /// installs.
+///
+/// ## Isolation, indexing and off-main writes
+///
+/// The library is held as a `RecordingIndex` (`[id:]`/`[sessionId:]` maps + a
+/// cached sorted array), guarded by a single `Mutex` (Synchronization). Every
+/// public accessor is **synchronous** and takes that lock, so the store is safe to read/write from
+/// any thread — reads are O(1) dictionary hits and `recordings` no longer
+/// re-sorts on each access. This root-fixes the former unsynchronised-`cache`
+/// data race: correctness no longer depends on ~120 call sites each being on the
+/// right thread (the `SyncManager` main-hop can stay as belt-and-suspenders).
+///
+/// Encoding + the atomic disk write happen **off the main thread** on a serial
+/// `ioQueue`, from a snapshot taken under the lock (the lock is never held across
+/// the write). Saves are **coalesced**: a burst of single-field mutations in a
+/// loop collapses to one whole-library serialization instead of N —
+///
+/// - `update` schedules a **debounced** save (~150 ms cancel-and-reschedule), so
+///   the reconciliation loops in `AppModel.syncReminders`/`syncTaskCalendar` and
+///   the tag/series sweeps coalesce automatically; `batchUpdate` mutates every
+///   row and saves once for the same reason.
+/// - Structural / user-visible durable events (`add`, `replaceAll`, `delete`,
+///   `markSynced`, `batchUpdate`) save **immediately** (still off-main) so the
+///   window in which a force-kill could lose them is a dispatch hop, not 150 ms.
+/// - `flush()` performs a **synchronous** write and is called at lifecycle
+///   boundaries (scene → background, terminate) where the process may be
+///   suspended before an async write lands.
+///
+/// **Reentrancy:** the mutex is non-recursive, so a `mutate`/`batchUpdate`
+/// closure must not call back into a public method of this store (all existing
+/// closures only touch the `inout Recording`). Write failures are logged and
+/// surfaced via `lastSaveError` rather than swallowed with `try?`.
 final class RecordingStore {
 
     static let shared = RecordingStore()
@@ -19,31 +51,100 @@ final class RecordingStore {
 
     private let defaults = UserDefaults.standard
     private let storeURL: URL
-    private var cache: [Recording] = []
 
-    /// Set when `library.json` existed at launch but couldn't be decoded, *and*
-    /// the unreadable file couldn't be moved aside. While true, `save()` refuses
-    /// to write — so a decode bug a future build could fix can't be turned into
-    /// permanent, silent data loss by the next background mutation overwriting
-    /// the only copy with `[]`. If the file was successfully preserved
-    /// (`library.corrupt-<ts>.json`), this stays `false` and saves proceed
-    /// normally against a fresh library.
-    private var refusesToSave = false
+    /// Everything the mutex protects, kept in one value so a single `Mutex`
+    /// guards it all. `withLock` hands the body scoped, `inout` access — there is
+    /// no raw lock/unlock to leak, and the type system enforces that the state is
+    /// only reachable through the mutex.
+    private struct State {
+        var index: RecordingIndex
+        /// Set when `library.json` existed at launch but couldn't be decoded, *and*
+        /// the unreadable file couldn't be moved aside. While true, saves refuse to
+        /// write — so a decode bug a future build could fix can't be turned into
+        /// permanent, silent data loss by the next background mutation overwriting
+        /// the only copy with `[]`. If the file was successfully preserved
+        /// (`library.corrupt-<ts>.json`), this stays `false` and saves proceed
+        /// normally against a fresh library.
+        var refusesToSave: Bool
+        /// The pending debounced save, cancelled and rescheduled on each `update`
+        /// so a loop of mutations coalesces into one write.
+        var pendingSave: DispatchWorkItem?
+        /// The most recent save failure (encode or write), or nil after a success.
+        var lastSaveError: Error?
+    }
+
+    /// Guards `State`. Swift `Mutex` (Synchronization) rather than a raw lock:
+    /// scoped `withLock {}` access is harder to misuse than lock/unlock, and it's
+    /// a value type. Non-recursive — a `mutate`/`batchUpdate` closure must not
+    /// call back into a public store method, and the lock is never held across the
+    /// disk write (snapshot under `withLock`, then encode+write on `ioQueue`).
+    private let state: Mutex<State>
+
+    /// Serial queue that owns every encode + atomic write. `.utility` because a
+    /// library save is background housekeeping, never latency-critical for the UI.
+    private let ioQueue = DispatchQueue(label: "ai.bounce.recordingstore.io", qos: .utility)
+    private let debounceInterval: DispatchTimeInterval = .milliseconds(150)
+
+    /// The most recent save failure (encode or write), or nil after a success.
+    /// Surfaced instead of swallowing the error with `try?` so a disk-full or
+    /// locked-file failure can't silently diverge the in-memory library from disk.
+    var lastSaveError: Error? {
+        state.withLock { $0.lastSaveError }
+    }
 
     private init() {
         storeURL = Self.documentsDirectory.appendingPathComponent("library.json")
+        let loadedIndex: RecordingIndex
+        var refuses = false
         switch Self.load(from: storeURL) {
         case .loaded(let recordings):
-            cache = recordings
+            loadedIndex = RecordingIndex(recordings)
         case .missing:
-            cache = []
+            loadedIndex = RecordingIndex()
         case .corrupt:
-            cache = []
+            loadedIndex = RecordingIndex()
             // A decode failure is recoverable by a future fix, but only while the
             // bytes still exist. Preserve them before anything can overwrite the
             // library with []; if that move fails, protect the file by refusing
             // to save this session.
-            refusesToSave = !Self.preserveCorrupt(at: storeURL)
+            refuses = !Self.preserveCorrupt(at: storeURL)
+        }
+        state = Mutex(State(index: loadedIndex, refusesToSave: refuses, pendingSave: nil, lastSaveError: nil))
+        backupOnceIfNeeded()
+    }
+
+    /// One-time, best-effort copy of the existing `library.json` aside, made the
+    /// first time this build's new store runs. Pure belt-and-suspenders: if a
+    /// rollout bug in the rewritten save path ever wrote bad data, the untouched
+    /// pre-refactor library is still on disk as `library.backup-<ts>.json`.
+    ///
+    /// Enqueued on `ioQueue` from `init`, so it is off the main thread (never
+    /// blocks launch) and — because that queue is serial — runs *before* the
+    /// first save this session could enqueue. Gated by a `UserDefaults` marker so
+    /// it happens once. The marker is set only when the backup succeeds or there
+    /// is nothing to back up, so a transient copy failure retries next launch
+    /// rather than being lost.
+    private func backupOnceIfNeeded() {
+        let markerKey = "store.backup.preIndexRefactor.done"
+        guard !defaults.bool(forKey: markerKey) else { return }
+        let src = storeURL
+        let stamp = Int(Date().timeIntervalSince1970)
+        ioQueue.async { [defaults] in
+            guard FileManager.default.fileExists(atPath: src.path) else {
+                // No library yet (first install) — nothing to protect, don't retry.
+                defaults.set(true, forKey: markerKey)
+                return
+            }
+            let dst = src.deletingLastPathComponent()
+                .appendingPathComponent("library.backup-\(stamp).json")
+            do {
+                try FileManager.default.copyItem(at: src, to: dst)
+                defaults.set(true, forKey: markerKey)
+                print("[Store] one-time pre-refactor backup written: \(dst.lastPathComponent)")
+            } catch {
+                // Leave the marker unset so the next launch tries again.
+                print("[Store] one-time pre-refactor backup failed (\(error.localizedDescription)); will retry next launch")
+            }
         }
     }
 
@@ -142,26 +243,32 @@ final class RecordingStore {
 
     var hasPairedDevice: Bool { !pairedDeviceSNs.isEmpty && userId != nil }
 
-    // MARK: - Library
+    // MARK: - Library (reads — O(1)/no per-access re-sort, under the lock)
 
     /// Newest first.
     var recordings: [Recording] {
-        cache.sorted { $0.createdAt > $1.createdAt }
+        state.withLock { $0.index.sorted() }
     }
 
     func recording(id: String) -> Recording? {
-        cache.first { $0.id == id }
+        state.withLock { $0.index.recording(id: id) }
     }
 
     func recording(sessionId: Int) -> Recording? {
-        cache.first { $0.sessionId == sessionId }
+        state.withLock { $0.index.recording(sessionId: sessionId) }
     }
 
-    /// Insert, skipping any session id already present.
+    // MARK: - Library (mutations)
+
+    /// Insert, skipping any session id already present. Saves immediately
+    /// (off-main): a new/merged recording is a durable event worth persisting
+    /// without waiting out the debounce window.
     func add(_ newRecordings: [Recording]) {
-        let known = Set(cache.map(\.sessionId))
-        cache.append(contentsOf: newRecordings.filter { !known.contains($0.sessionId) })
-        save()
+        let (snapshot, refuses) = state.withLock { s -> ([Recording], Bool) in
+            s.index.add(newRecordings)
+            return (s.index.allUnsorted, s.refusesToSave)
+        }
+        saveNow(snapshot: snapshot, refuses: refuses)
     }
 
     /// A `sessionId` the recorder can never produce, for a recording this app
@@ -179,21 +286,35 @@ final class RecordingStore {
     /// `Web/LiveChannel` uses it as its "no live session" sentinel and sharing the
     /// value only makes logs ambiguous.
     func syntheticSessionId() -> Int {
-        var candidate = -Int(Date().timeIntervalSince1970 * 1000)
-        while candidate == -1 || recording(sessionId: candidate) != nil {
-            candidate -= 1
+        state.withLock { s in
+            var candidate = -Int(Date().timeIntervalSince1970 * 1000)
+            // Uses the index directly rather than the public `recording(sessionId:)`,
+            // which would re-enter the non-recursive mutex and deadlock.
+            while candidate == -1 || s.index.recording(sessionId: candidate) != nil {
+                candidate -= 1
+            }
+            return candidate
         }
-        return candidate
     }
 
-    /// Replace the whole library — used by sync reconciliation.
+    /// Replace the whole library — used by sync reconciliation. Saves immediately.
     func replaceAll(_ recordings: [Recording]) {
-        cache = recordings
-        save()
+        let (snapshot, refuses) = state.withLock { s -> ([Recording], Bool) in
+            s.index.replaceAll(recordings)
+            return (s.index.allUnsorted, s.refusesToSave)
+        }
+        saveNow(snapshot: snapshot, refuses: refuses)
     }
 
     func delete(id: String) {
-        if let recording = recording(id: id) {
+        let (removed, snapshot, refuses) = state.withLock { s -> (Recording?, [Recording], Bool) in
+            let removed = s.index.remove(id: id)
+            return (removed, s.index.allUnsorted, s.refusesToSave)
+        }
+
+        // File-system cleanup happens off the lock (FileManager / WaveformCache
+        // must never run while the mutex is held).
+        if let recording = removed {
             if let url = audioURL(for: recording) {
                 try? FileManager.default.removeItem(at: url)
             }
@@ -206,38 +327,161 @@ final class RecordingStore {
                 WaveformCache.forget(audioNamed: name)
             }
         }
-        cache.removeAll { $0.id == id }
-        save()
+        saveNow(snapshot: snapshot, refuses: refuses)
     }
 
-    /// Mutate one recording in place. No-op if the id is unknown.
+    /// Mutate one recording in place. No-op if the id is unknown. Schedules a
+    /// **debounced** save so a loop of `update`s (Reminders/Calendar reconcile,
+    /// tag/series sweeps) coalesces into a single whole-library write.
+    ///
+    /// The `mutate` closure runs while the mutex is held and must not call back
+    /// into this store.
     func update(id: String, _ mutate: (inout Recording) -> Void) {
-        guard let index = cache.firstIndex(where: { $0.id == id }) else { return }
-        mutate(&cache[index])
-        save()
+        let result = state.withLock { s -> ([Recording], Bool)? in
+            guard s.index.update(id: id, mutate) else { return nil }
+            return (s.index.allUnsorted, s.refusesToSave)
+        }
+        if let (snapshot, refuses) = result { scheduleSave(snapshot: snapshot, refuses: refuses) }
+    }
+
+    /// Mutate **every** recording in one pass and save once. The closure guards
+    /// itself (e.g. `guard var items = rec.actionItems`), mirroring the old
+    /// `for recording in recordings { update(...) }` loops but without N
+    /// whole-library serializations. Saves immediately when anything changed.
+    func batchUpdate(_ mutate: (inout Recording) -> Void) {
+        let result = state.withLock { s -> ([Recording], Bool)? in
+            guard s.index.updateEach(mutate) > 0 else { return nil }
+            return (s.index.allUnsorted, s.refusesToSave)
+        }
+        if let (snapshot, refuses) = result { saveNow(snapshot: snapshot, refuses: refuses) }
     }
 
     func markSynced(sessionId: Int, outputPath: String, duration: TimeInterval? = nil) {
-        guard let index = cache.firstIndex(where: { $0.sessionId == sessionId }) else { return }
-        cache[index].syncedAt = Date()
-        cache[index].audioFilename = (outputPath as NSString).lastPathComponent
-        if let duration, duration > 0 { cache[index].duration = duration }
-        save()
+        let result = state.withLock { s -> ([Recording], Bool)? in
+            guard let existing = s.index.recording(sessionId: sessionId) else { return nil }
+            let found = s.index.update(id: existing.id) { rec in
+                rec.syncedAt = Date()
+                rec.audioFilename = (outputPath as NSString).lastPathComponent
+                if let duration, duration > 0 { rec.duration = duration }
+            }
+            return found ? (s.index.allUnsorted, s.refusesToSave) : nil
+        }
+        // A file becoming synced is durable (and, unpersisted, re-downloads on the
+        // next connect), so save immediately rather than debounced.
+        if let (snapshot, refuses) = result { saveNow(snapshot: snapshot, refuses: refuses) }
     }
 
     func clearAll() {
-        for recording in cache {
+        let (all, refuses) = state.withLock { s -> ([Recording], Bool) in
+            let all = s.index.allUnsorted
+            s.index.replaceAll([])
+            return (all, s.refusesToSave)
+        }
+
+        for recording in all {
             if let url = audioURL(for: recording) { try? FileManager.default.removeItem(at: url) }
         }
-        cache = []
         pairedDeviceSNs = []
         activeDeviceSN = nil
         pairedDeviceNames = [:]
         userId = nil
-        save()
+        saveNow(snapshot: [], refuses: refuses)
+    }
+
+    /// Synchronously flush any pending write to disk. Called at lifecycle
+    /// boundaries (scene → background, terminate) where the process may be
+    /// suspended before an async save lands. Blocks the caller until the write
+    /// completes; use only at those boundaries, not on hot paths.
+    func flush() {
+        let (snapshot, refuses) = state.withLock { s -> ([Recording], Bool) in
+            s.pendingSave?.cancel()
+            s.pendingSave = nil
+            return (s.index.allUnsorted, s.refusesToSave)
+        }
+        ioQueue.sync { self.write(snapshot, refuses: refuses) }
     }
 
     // MARK: - Disk
+
+    /// Cancel any in-flight debounced save and schedule a fresh one. A burst of
+    /// mutations therefore results in exactly one write, ~`debounceInterval` after
+    /// the last one.
+    private func scheduleSave(snapshot: [Recording], refuses: Bool) {
+        let work = DispatchWorkItem { [weak self] in self?.write(snapshot, refuses: refuses) }
+        state.withLock { s in
+            s.pendingSave?.cancel()
+            s.pendingSave = work
+        }
+        ioQueue.asyncAfter(deadline: .now() + debounceInterval, execute: work)
+    }
+
+    /// Write immediately (still off-main) — no debounce wait. Cancels any pending
+    /// debounced save first so the two can't race to write stale-then-fresh.
+    private func saveNow(snapshot: [Recording], refuses: Bool) {
+        state.withLock { s in
+            s.pendingSave?.cancel()
+            s.pendingSave = nil
+        }
+        ioQueue.async { self.write(snapshot, refuses: refuses) }
+    }
+
+    /// The one place that encodes + atomically writes the library. Always runs on
+    /// `ioQueue`; never holds the mutex.
+    private func write(_ recordings: [Recording], refuses: Bool) {
+        // An undecodable library at launch that couldn't be preserved aside is
+        // protected here: writing now would overwrite the only recoverable copy
+        // with whatever this session built ([] in the worst case). See `init`.
+        guard !refuses else {
+            print("[Store] save skipped — library failed to decode this launch and is being protected")
+            return
+        }
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(recordings)
+        } catch {
+            // The encode leg (e.g. a non-finite float in a segment time). Surface
+            // it rather than silently keeping disk stale.
+            recordSaveError(error, phase: "encode")
+            return
+        }
+        do {
+            // Explicit protection class rather than relying on the platform default
+            // (which happens to be the same class today): this file holds every
+            // transcript in the library, and pinning the intent here means a future
+            // change elsewhere can't silently weaken it to `.none` without the diff
+            // being visible in this line. `.untilFirstUserAuthentication`, not
+            // `.complete` or `.completeUnlessOpen` — sync can be triggered by a BLE
+            // reconnect while the app is backgrounded, and either stronger class
+            // would make this write (and the read at init) fail whenever that
+            // happens with the phone locked and not yet unlocked since boot.
+            try data.write(
+                to: storeURL,
+                options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            clearSaveError()
+        } catch {
+            // The write leg — disk full, or the protection class rejecting the
+            // write while the device is locked and not yet unlocked since boot.
+            // Previously swallowed with `try?`, which let the in-memory library
+            // diverge from disk with no signal. Retry once, then surface.
+            do {
+                try data.write(
+                    to: storeURL,
+                    options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+                clearSaveError()
+            } catch {
+                recordSaveError(error, phase: "write")
+            }
+        }
+    }
+
+    private func recordSaveError(_ error: Error, phase: String) {
+        state.withLock { $0.lastSaveError = error }
+        print("[Store] library \(phase) failed: \(error.localizedDescription) — in-memory library is ahead of disk")
+    }
+
+    private func clearSaveError() {
+        state.withLock { if $0.lastSaveError != nil { $0.lastSaveError = nil } }
+    }
 
     /// Outcome of reading `library.json`. The distinction between `.missing` and
     /// `.corrupt` is the whole point: conflating them (returning `[]` for both)
@@ -319,28 +563,5 @@ final class RecordingStore {
             localeIdentifier: transcript.localeIdentifier,
             createdAt: transcript.createdAt,
             isPreview: transcript.isPreview)
-    }
-
-    private func save() {
-        // An undecodable library at launch that couldn't be preserved aside is
-        // protected here: writing now would overwrite the only recoverable copy
-        // with whatever this session built ([] in the worst case). See `init`.
-        guard !refusesToSave else {
-            print("[Store] save skipped — library failed to decode this launch and is being protected")
-            return
-        }
-        guard let data = try? JSONEncoder().encode(cache) else { return }
-        // Explicit rather than relying on the platform default (which happens to
-        // be the same class today): this file holds every transcript in the
-        // library, and pinning the intent here means a future change elsewhere
-        // can't silently weaken it to `.none` without the diff being visible in
-        // this line. `.untilFirstUserAuthentication`, not `.complete` or
-        // `.completeUnlessOpen` — sync can be triggered by a BLE reconnect while
-        // the app is backgrounded, and either stronger class would make this
-        // write (and the read at init) fail whenever that happens with the
-        // phone locked and not yet unlocked since boot.
-        try? data.write(
-            to: storeURL,
-            options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
     }
 }

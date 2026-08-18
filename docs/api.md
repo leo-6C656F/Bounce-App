@@ -470,51 +470,70 @@ from the phone.
 
 #### `GET /api/library`
 
-Every recording, newest first, as summary rows. **Transcript text is
+Recordings, newest first, as summary rows, **in pages**. **Transcript text is
 deliberately excluded** — a library of long meetings would be megabytes per
 refresh. Fetch a recording to get its text.
 
+The response is a `{items, total, offset, limit}` envelope rather than a bare
+array, so a large library is never serialized into one blob on the phone's main
+actor. Page with `offset` and `limit`:
+
+| Query | Default | Meaning |
+|---|---|---|
+| `offset` | `0` | Row index to start at (0-based, clamped to ≥ 0) |
+| `limit` | `200` | Rows to return (clamped to 1…500) |
+
+Walk pages until `offset + items.length >= total`. The in-progress recording, when
+present, is pinned at global index 0 and so appears on the first page.
+
 ```bash
 curl -k -H "Authorization: Bearer $BOUNCE_TOKEN" \
-  https://192.168.1.42:8080/api/library
+  "https://192.168.1.42:8080/api/library?offset=0&limit=200"
 ```
 
 ```json
-[
-  {
-    "id": "live",
-    "title": "Recording in progress",
-    "categoryName": null,
-    "createdAt": "2026-07-31T14:02:11Z",
-    "duration": 184.3,
-    "durationText": "3:04",
-    "isSynced": false,
-    "isTranscribed": false,
-    "isPreview": true,
-    "wordCount": 412,
-    "summaryCount": 0,
-    "highlightCount": 1,
-    "speakerCount": 2,
-    "status": "Recording"
-  },
-  {
-    "id": "4C1F9B2A-7E30-4A6D-9C11-0B8E5D2F6A44",
-    "title": "Budget review",
-    "categoryName": "Meeting",
-    "createdAt": "2026-07-30T09:14:22Z",
-    "duration": 2734.0,
-    "durationText": "45:34",
-    "isSynced": true,
-    "isTranscribed": true,
-    "isPreview": false,
-    "wordCount": 6841,
-    "summaryCount": 2,
-    "highlightCount": 3,
-    "speakerCount": 4,
-    "status": null
-  }
-]
+{
+  "total": 842,
+  "offset": 0,
+  "limit": 200,
+  "items": [
+    {
+      "id": "live",
+      "title": "Recording in progress",
+      "categoryName": null,
+      "createdAt": "2026-07-31T14:02:11Z",
+      "duration": 184.3,
+      "durationText": "3:04",
+      "isSynced": false,
+      "isTranscribed": false,
+      "isPreview": true,
+      "wordCount": 412,
+      "summaryCount": 0,
+      "highlightCount": 1,
+      "speakerCount": 2,
+      "status": "Recording"
+    },
+    {
+      "id": "4C1F9B2A-7E30-4A6D-9C11-0B8E5D2F6A44",
+      "title": "Budget review",
+      "categoryName": "Meeting",
+      "createdAt": "2026-07-30T09:14:22Z",
+      "duration": 2734.0,
+      "durationText": "45:34",
+      "isSynced": true,
+      "isTranscribed": true,
+      "isPreview": false,
+      "wordCount": 6841,
+      "summaryCount": 2,
+      "highlightCount": 3,
+      "speakerCount": 4,
+      "status": null
+    }
+  ]
+}
 ```
+
+Each entry in `items` is a `WebRecordingRow`:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -545,11 +564,12 @@ curl -k -H "Authorization: Bearer $BOUNCE_TOKEN" \
 #### `GET /api/search?q=<text>`
 
 Recordings whose **title or transcript** contains `q`, case-insensitively.
-Returns the same `WebRecordingRow` shape as `/api/library`.
+Returns the same paginated `{items, total, offset, limit}` envelope as
+`/api/library`, where each item is a `WebRecordingRow`.
 
 ```bash
 curl -k -H "Authorization: Bearer $BOUNCE_TOKEN" \
-  --get --data-urlencode 'q=hiring line' \
+  --get --data-urlencode 'q=hiring line' --data-urlencode 'limit=200' \
   https://192.168.1.42:8080/api/search
 ```
 
@@ -559,11 +579,14 @@ payload would carry every transcript. It matches on exactly the same two fields,
 in the same order, as the Library screen's own search field, so the phone and a
 script find the same recordings for the same words.
 
-Unlike `/api/library`, the in-progress recording is **not** pinned to the top;
-search only covers stored recordings.
+Accepts the same `offset`/`limit` paging as `/api/library`. Matches are collected
+into a lowercased index rather than re-scanning every transcript per request, and
+capped at 1000 across all pages, so a one-character query can't return the whole
+library. Unlike `/api/library`, the in-progress recording is **not** pinned to the
+top; search only covers stored recordings.
 
 **Errors:** **400** `{"error":"Missing q."}` when `q` is absent or blank. An empty
-result is a `200` with `[]`.
+result is a `200` with an empty `items` array and `total: 0`.
 
 ---
 
@@ -697,15 +720,25 @@ curl -kN -H "Authorization: Bearer $BOUNCE_TOKEN" \
 ```
 
 Updates are polled and diffed at **4 Hz** and only sent on a change, plus a
-heartbeat every 15 seconds.
+heartbeat every 15 seconds. (The `library` fingerprint is the exception, checked
+at ~1 Hz — it hashes the whole library, and the library changes far slower than
+the transcript.)
 
 | `type` | Payload | When |
 |---|---|---|
-| `live` | `isRunning`, `sessionId`, `error`, `volatile`, `blocks` | The live transcript changed. `volatile` is the not-yet-final text being spoken; `blocks` are settled `WebBlock`s |
+| `live` | `isRunning`, `sessionId`, `error`, `volatile`, `full`, `replaceFrom`, `blocks` | The live transcript changed. `volatile` is the not-yet-final text being spoken. **`blocks` is a delta, not the whole transcript:** replace your block list from index `replaceFrom` with `blocks`, keeping `[0, replaceFrom)`. `full: true` marks a complete snapshot (`replaceFrom` is 0, `blocks` is everything) — the first event after you connect or reconnect, and after a new recording starts, is always a full one, so you never apply a delta to a transcript you never received |
 | `status` | `connected`, `deviceName`, `isRecording`, `transcribing` | Recorder connection or transcription state changed. `transcribing` is the id of the recording being worked on, or null |
-| `library` | — | Something in the library changed. **This is a signal to refetch `/api/library`, not the data** — sending the whole list at 4 Hz would re-encode every transcript |
+| `library` | — | Something in the library changed. **This is a signal to refetch `/api/library`, not the data** — sending the whole list would re-encode every transcript |
 | `ping` | — | Heartbeat, every 15s. Ignore it; it exists to notice dead sockets |
 | `unauthorized` | — | Your credential isn't (or is no longer) good. The stream closes right after |
+
+> **Applying `live` deltas.** Keep a local block list. On `full`, replace it with
+> `blocks`. Otherwise splice: `blocks.slice(0, replaceFrom).concat(payload.blocks)`.
+> A delta whose `replaceFrom` equals your current block count with an empty
+> `blocks` array is a volatile-only update — just update the tail text. Because a
+> full snapshot always precedes any delta on a fresh stream, a client that only
+> ever handled `full` (ignoring `replaceFrom`) would still be correct on connect,
+> just not incrementally updated.
 
 **The `unauthorized` quirk.** This route never answers `401`, because
 `EventSource` treats any non-200 as fatal and would never retry. Both an

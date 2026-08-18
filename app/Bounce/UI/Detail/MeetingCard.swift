@@ -15,6 +15,7 @@ import SwiftUI
 struct MeetingCard: View {
 
     let recording: Recording
+    @Environment(AppModel.self) private var model
     @State private var isPicking = false
 
     private var linkedTitle: String? {
@@ -22,6 +23,16 @@ struct MeetingCard: View {
               !title.isEmpty
         else { return nil }
         return title
+    }
+
+    /// Whether offering "Use meeting name" would do anything — a meeting is linked
+    /// and the recording isn't already called that. Keeps the action off the card
+    /// when it would be a no-op (an untitled recording, or one linking already
+    /// adopted the name).
+    private var canAdoptMeetingName: Bool {
+        guard let linkedTitle else { return false }
+        let current = recording.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return current.caseInsensitiveCompare(linkedTitle) != .orderedSame
     }
 
     var body: some View {
@@ -62,6 +73,16 @@ struct MeetingCard: View {
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
+            // One-tap adoption of the meeting's name, without opening the picker —
+            // the escape hatch behind the link rule that won't overwrite a title
+            // the user typed. Hidden when the recording is already called that.
+            .contextMenu {
+                if canAdoptMeetingName {
+                    Button("Use meeting name", systemImage: "textformat") {
+                        model.adoptMeetingTitle(for: recording)
+                    }
+                }
+            }
         }
     }
 
@@ -129,7 +150,7 @@ struct MeetingPicker: View {
         }
         .task {
             calendar.refreshAuthorizationStatus()
-            load()
+            await load()
         }
     }
 
@@ -147,6 +168,17 @@ struct MeetingPicker: View {
                     Text("No meetings found in your calendars around this recording. It was made from \(windowText).")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                }
+            }
+
+            if let meetingTitle = adoptableMeetingTitle {
+                Section {
+                    Button("Use “\(meetingTitle)” as the title", systemImage: "textformat") {
+                        model.adoptMeetingTitle(for: recording)
+                        dismiss()
+                    }
+                } footer: {
+                    Text("Renames this recording to the meeting's name. Linking a meeting leaves a title you typed yourself alone — this takes the meeting's name anyway.")
                 }
             }
 
@@ -200,13 +232,24 @@ struct MeetingPicker: View {
                 Button("Allow calendar access") {
                     Task {
                         await calendar.requestAccess()
-                        load()
+                        await load()
                     }
                 }
             } footer: {
                 Text("Bounce needs access to your calendars to show the meetings around this recording. It only reads events — it never adds, edits, or deletes anything.")
             }
         }
+    }
+
+    /// The linked meeting's name, but only when adopting it would change the
+    /// title — so the button doesn't offer to rename a recording to what it's
+    /// already called.
+    private var adoptableMeetingTitle: String? {
+        guard let title = recording.calendarEventTitle?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty
+        else { return nil }
+        let current = recording.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return current.caseInsensitiveCompare(title) == .orderedSame ? nil : title
     }
 
     // MARK: - Grouping
@@ -237,9 +280,9 @@ struct MeetingPicker: View {
 
     // MARK: - Helpers
 
-    private func load() {
+    private func load() async {
         guard calendar.canReadEvents else { return }
-        events = calendar.surroundingEvents(
+        events = await calendar.surroundingEvents(
             recordingStart: recording.createdAt,
             duration: recording.duration)
         hasLoaded = true

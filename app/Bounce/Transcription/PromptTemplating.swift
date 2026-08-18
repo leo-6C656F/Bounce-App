@@ -194,19 +194,26 @@ enum PromptID {
 /// The shipped text of every prompt, and the single source of it.
 ///
 /// The owning types (`TranscriptQA`, `SummaryGenerator`, `AutoOrganizer`,
-/// `ActionItemExtractor`, `DueDateResolver`) read their prompt from
-/// `PromptStore.text(for:)` rather than holding a literal, so what the user sees in
-/// Settings is exactly what runs. Keeping the text here rather than in each type is
-/// what makes that true — two copies would drift the moment one is edited.
+/// `ActionItemExtractor`) read their prompt from `PromptStore.text(for:)`/`filled(_:with:)`
+/// rather than holding a literal, so what the user sees in Settings is exactly what
+/// runs; each falls back to the matching `PromptDefaults` entry only for the
+/// impossible case of the catalogue having lost the id. The one indirection is
+/// `dueDateRules`: `DueDateResolver` stays pure Foundation (no `PromptStore`, so
+/// `tools/due-date-tests` can drive it), so `ActionItemExtractor` — its caller —
+/// does the `PromptStore` routing, filling this template with the date anchors
+/// `DueDateResolver.ruleValues(recordedAt:calendar:)` computes. Keeping the text
+/// here rather than in each type is what makes "what you see is what runs" true —
+/// two copies would drift the moment one is edited.
 enum PromptDefaults {
 
-    /// `TranscriptQA.ground(on:)`.
+    /// `TranscriptQA.ground(on:)`. One transcript in the detail view, several
+    /// concatenated in library-wide Ask — hence "transcript(s)".
     static let qaGrounding = """
-        You answer questions about the transcript below, which is a recording the \
-        user made. Base your answer on what the transcript says — you may quote it, \
-        paraphrase it, summarize it, or draw reasonable conclusions from it. Only \
-        say you don't know if the transcript genuinely contains nothing relevant to \
-        the question; do not refuse just because the wording differs.
+        You answer questions about the transcript(s) below from the user's recordings. \
+        Base your answer on what the transcripts say. You may quote, summarize, or draw \
+        reasonable conclusions or inferences (for example, inferring the overall reason or purpose \
+        for a meeting from its main discussion points). Only say you don't know \
+        if the transcripts genuinely contain no relevant information.
 
         Reply in plain, natural sentences — never JSON, key–value pairs, code, or \
         markdown. Keep it concise and speak directly to the user.

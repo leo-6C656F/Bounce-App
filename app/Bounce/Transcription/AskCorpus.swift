@@ -80,7 +80,10 @@ enum AskCorpus {
         guard !words.isEmpty else { return window ?? [] }
 
         let keywordMatches = candidates.filter { recording in
-            let text = recording.transcript?.plainText.lowercased() ?? ""
+            // Reuses the same cached lowercased haystack as library search
+            // (S-8/S-9), instead of re-joining and re-lowercasing every
+            // transcript on each Ask.
+            let text = RecordingSearchIndex.shared.haystack(for: recording)
             return words.contains { text.contains($0) }
         }
         // Inside a named window, no keyword hit still means "these are the

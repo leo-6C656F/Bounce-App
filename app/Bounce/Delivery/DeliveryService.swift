@@ -73,7 +73,7 @@ struct DeliveryService {
         case .folder:
             guard let folder = settings.resolveFolder() else { throw Failure.folderUnavailable }
             defer { folder.stopAccessingSecurityScopedResource() }
-            try writeToFolder(payload, in: folder)
+            try await writeToFolder(payload, in: folder)
         }
 
         RecordingStore.shared.update(id: recording.id) { stored in
@@ -237,20 +237,35 @@ struct DeliveryService {
 
     // MARK: - Folder
 
-    private func writeToFolder(_ payload: Payload, in folder: URL) throws {
-        if let audioURL = payload.audioURL {
-            let destination = folder.appendingPathComponent("\(payload.basename).\(audioURL.pathExtension)")
-            if FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.removeItem(at: destination)
-            }
-            try FileManager.default.copyItem(at: audioURL, to: destination)
-        }
+    /// Copies the audio (and writes the transcript) into the destination folder.
+    ///
+    /// `async`, and the file work runs **off the main actor** (S-11): the folder
+    /// is a user-picked security-scoped URL, commonly iCloud Drive or an external
+    /// volume, so `copyItem` is a real byte copy of a multi-MB MP3 that has no
+    /// business on the main thread. The caller's `defer` holds the security scope
+    /// open across the await — that scope is process-wide, so it remains valid on
+    /// the detached task — and stops it once this returns.
+    private func writeToFolder(_ payload: Payload, in folder: URL) async throws {
+        let audioURL = payload.audioURL
+        let basename = payload.basename
+        let text = payload.transcriptText
+        let textExtension = payload.transcriptFormat.fileExtension
 
-        if let text = payload.transcriptText {
-            let destination = folder
-                .appendingPathComponent("\(payload.basename).\(payload.transcriptFormat.fileExtension)")
-            try Data(text.utf8).write(to: destination, options: .atomic)
-        }
+        try await Task.detached(priority: .utility) {
+            let fileManager = FileManager.default
+            if let audioURL {
+                let destination = folder.appendingPathComponent("\(basename).\(audioURL.pathExtension)")
+                if fileManager.fileExists(atPath: destination.path) {
+                    try fileManager.removeItem(at: destination)
+                }
+                try fileManager.copyItem(at: audioURL, to: destination)
+            }
+
+            if let text {
+                let destination = folder.appendingPathComponent("\(basename).\(textExtension)")
+                try Data(text.utf8).write(to: destination, options: .atomic)
+            }
+        }.value
     }
 
     // MARK: - Helpers

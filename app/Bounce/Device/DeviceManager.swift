@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import Synchronization
 import PlaudBleSDK
 // @preconcurrency: the SDK predates strict Sendable annotation, so its
 // callback types and closures would otherwise emit concurrency warnings on
@@ -85,10 +86,15 @@ final class DeviceManager: NSObject, @unchecked Sendable {
     #endif
 
     /// Counts `blePcmData` callbacks, purely so the logging can be sparse.
-    private var pcmPacketCount = 0
+    ///
+    /// Atomic because these three are incremented on SDK-internal callback queues,
+    /// outside the main-queue confinement the rest of this `@unchecked Sendable`
+    /// type relies on — a torn increment or read here misreports the diagnostic,
+    /// and the annotation would otherwise be hiding a genuine race (S-20).
+    private let pcmPacketCount = Atomic<Int>(0)
     /// Same, for the raw encrypted stream probe in `bleData`.
-    private var rawDataPacketCount = 0
-    private var rawDataBytes = 0
+    private let rawDataPacketCount = Atomic<Int>(0)
+    private let rawDataBytes = Atomic<Int>(0)
 
     private override init() {
         super.init()
@@ -641,6 +647,13 @@ extension DeviceManager: PlaudDeviceAgentProtocol {
 
             case 1:
                 self.stopAutoReconnect()
+                // Stop the unfiltered, AllowDuplicates-on fallback scan now that we
+                // are connected (S-13). `startScan` starts it alongside the SDK's,
+                // but its only other stopper is `AppModel.endPairing()`, which the
+                // auto-reconnect/connect path never calls — so without this it ran
+                // its own `CBCentralManager` scan for the whole connected session,
+                // a permanent radio/CPU drain.
+                BluetoothMonitor.shared.stopFallbackScan()
                 self.isUserDisconnect = false
                 self.connectionStateSubject.send(.connected)
 
@@ -834,9 +847,9 @@ extension DeviceManager: PlaudDeviceAgentProtocol {
         // Logged sparsely: this fires ~50 times a second, but knowing whether it
         // fires *at all* is the difference between "live transcription is broken"
         // and "the recorder never streamed us anything".
-        pcmPacketCount += 1
-        if pcmPacketCount == 1 || pcmPacketCount % 250 == 0 {
-            DeviceLog.log("blePcmData #\(pcmPacketCount) session=\(sessionId) "
+        let count = pcmPacketCount.wrappingAdd(1, ordering: .relaxed).newValue
+        if count == 1 || count % 250 == 0 {
+            DeviceLog.log("blePcmData #\(count) session=\(sessionId) "
                 + "\(pcmData.count) bytes at \(millsec)ms")
         }
         RecordingManager.shared.handlePcmData(pcmData)
@@ -907,28 +920,29 @@ extension DeviceManager: PlaudDeviceAgentProtocol {
                 sessionId: sessionId, offset: start, data: data, callbackAt: callbackAt)
         }
 
-        rawDataPacketCount += 1
-        rawDataBytes += data.count
-        if rawDataPacketCount == 1 || rawDataPacketCount % 50 == 0 {
+        let count = rawDataPacketCount.wrappingAdd(1, ordering: .relaxed).newValue
+        let total = rawDataBytes.wrappingAdd(data.count, ordering: .relaxed).newValue
+        if count == 1 || count % 50 == 0 {
             // First 16 bytes of the very first packet should be the
             // PlaudEncryptHeader magic, "PLAUD.AI", if this is the file header.
             let prefix = data.prefix(16).map { String(format: "%02X", $0) }.joined()
             let ascii = String(decoding: data.prefix(8), as: UTF8.self)
-            DeviceLog.log("bleData #\(rawDataPacketCount) session=\(sessionId) "
-                + "start=\(start) \(data.count) bytes (total \(rawDataBytes)) "
+            DeviceLog.log("bleData #\(count) session=\(sessionId) "
+                + "start=\(start) \(data.count) bytes (total \(total)) "
                 + "head=\(prefix) ascii=\(ascii.filter(\.isASCII))")
         }
     }
 
     func bleSyncFileHead(sessionId: Int, status: Int) {
         DeviceLog.log("bleSyncFileHead session=\(sessionId) status=\(status)")
-        rawDataPacketCount = 0
-        rawDataBytes = 0
+        rawDataPacketCount.store(0, ordering: .relaxed)
+        rawDataBytes.store(0, ordering: .relaxed)
     }
 
     func bleSyncFileTail(sessionId: Int, crc: Int) {
         DeviceLog.log("bleSyncFileTail session=\(sessionId) crc=\(crc) "
-            + "— \(rawDataPacketCount) packet(s), \(rawDataBytes) bytes total")
+            + "— \(rawDataPacketCount.load(ordering: .relaxed)) packet(s), "
+            + "\(rawDataBytes.load(ordering: .relaxed)) bytes total")
     }
 
     // MARK: Forward to DeviceSettings

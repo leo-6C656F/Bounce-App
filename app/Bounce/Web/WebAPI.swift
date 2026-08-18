@@ -23,6 +23,10 @@ final class WebAPI {
     private let live: LiveChannel
     /// In-flight summary jobs, keyed `recordingId|templateId`.
     private var summarizing: Set<String> = []
+    /// How long a `summarize` job may hold its key before the safety net frees
+    /// it. Generous — real on-device generation finishes in tens of seconds —
+    /// because the only thing it guards is a permanently-wedged model session.
+    private static let summaryJobTimeout: TimeInterval = 180
 
     /// The MCP server. Built here rather than injected because its only dependency
     /// is the same `AppModel` this type already holds, and it has no lifecycle of
@@ -128,7 +132,7 @@ final class WebAPI {
 
         // Collection routes.
         switch (request.method, path) {
-        case ("GET", "/api/library"):     return library()
+        case ("GET", "/api/library"):     return library(request)
         case ("GET", "/api/search"):      return search(request)
         case ("GET", "/api/openapi.json"): return openAPI()
         // Behind all four gates, like every other authenticated route — and the
@@ -332,7 +336,15 @@ final class WebAPI {
             // authenticates lives in memory and dies with the app, and cookies
             // ignore port, so a long-lived one would be offered to whatever
             // host holds this DHCP address next.
-            let cookie = "bounce_session=\(token); Path=/; HttpOnly; SameSite=Strict"
+            //
+            // `Secure` when the server is serving HTTPS (the default), so the
+            // cookie is never sent back over cleartext. It is *conditional*: with
+            // TLS switched off the origin is plain `http://192.168.x.x`, and a
+            // `Secure` cookie there would never be sent at all, silently breaking
+            // every authenticated request. `SameSite=Strict` already covers the
+            // cross-site case regardless of scheme.
+            let secure = DesktopServer.shared.useTLS ? "; Secure" : ""
+            let cookie = "bounce_session=\(token); Path=/; HttpOnly; SameSite=Strict\(secure)"
             let data = (try? JSONSerialization.data(withJSONObject: ["paired": true])) ?? Data()
             return .json(data, status: 200, extraHeaders: ["Set-Cookie": cookie])
 
@@ -415,10 +427,21 @@ final class WebAPI {
             ],
             "security": [["bearerAuth": [String]()]],
             "paths": [
-                "/api/library": path("Every recording, newest first."),
+                "/api/library": path(
+                    "A page of recordings, newest first. Returns "
+                        + "{items, total, offset, limit}; page with offset/limit.",
+                    params: [
+                        query("offset", "Row to start at (default 0).", required: false),
+                        query("limit", "Max rows to return (default 200, max 500).", required: false),
+                    ]),
                 "/api/search": path(
-                    "Recordings whose title or transcript contains a string.",
-                    params: [query("q", "Search text.", required: true)]),
+                    "A page of recordings whose title or transcript contains a "
+                        + "string. Returns {items, total, offset, limit}.",
+                    params: [
+                        query("q", "Search text.", required: true),
+                        query("offset", "Row to start at (default 0).", required: false),
+                        query("limit", "Max rows to return (default 200, max 500).", required: false),
+                    ]),
                 "/api/recordings/{id}": ["get": [
                     "summary": "One recording, with its transcript and summaries.",
                     "parameters": [idParam],
@@ -495,38 +518,77 @@ final class WebAPI {
     ///
     /// Returns rows, not details — the caller follows up with
     /// `/api/recordings/<id>` for the transcript it actually wants.
+    /// Default page size, and the ceiling a client can ask for. Generous — the
+    /// rows are small (no transcript text) — but bounded so one request can't
+    /// serialize the whole library on the main actor, which is A12's whole point.
+    private static let defaultPageLimit = 200
+    private static let maxPageLimit = 500
+    /// Hard ceiling on how many search matches are ever collected across all
+    /// pages, so a one-character query (`q=e`) can't build a result set the size
+    /// of the library.
+    private static let searchCeiling = 1000
+
+    /// `?offset=&limit=`, clamped. A missing or unparseable value falls back to
+    /// the default rather than erroring — pagination is an optimisation, and a
+    /// client that ignores it should still get a (bounded) first page.
+    private func pageBounds(_ request: HTTPRequest) -> (offset: Int, limit: Int) {
+        let requested = request.query["limit"].flatMap(Int.init) ?? Self.defaultPageLimit
+        let limit = min(max(1, requested), Self.maxPageLimit)
+        let offset = max(0, request.query["offset"].flatMap(Int.init) ?? 0)
+        return (offset, limit)
+    }
+
     private func search(_ request: HTTPRequest) -> HTTPResponse {
         let needle = (request.query["q"] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         guard !needle.isEmpty else { return .error(400, "Missing q.") }
 
-        // Deliberately the same two fields, in the same order, as
-        // `LibraryView.filtered` — a search that disagrees with the phone's own
-        // search would be a quiet trap.
-        let matches = RecordingStore.shared.recordings.filter { recording in
-            if recording.displayTitle.lowercased().contains(needle) { return true }
-            return recording.transcript?.plainText.lowercased().contains(needle) ?? false
-        }
-        return .json(matches.map { recording in
+        // The lowercase-per-transcript scan is gone: `WebSearchIndex` keeps a
+        // cached lowercased haystack per recording and caps the match set, so a
+        // search is a `contains` over pre-lowercased strings rather than tens of
+        // megabytes re-cased on the main actor per request (A13).
+        let (offset, limit) = pageBounds(request)
+        let matches = WebSearchIndex.shared.matches(needle, ceiling: Self.searchCeiling)
+        let total = matches.count
+        let window = offset < total ? matches[offset..<min(offset + limit, total)] : matches[0..<0]
+        let items = window.map { recording in
             WebRecordingRow(
                 recording,
                 status: TranscriptionCoordinator.shared.status(for: recording)?.label)
-        })
+        }
+        return .json(WebLibraryPage(items: items, total: total, offset: offset, limit: limit))
     }
 
-    private func library() -> HTTPResponse {
-        var rows = RecordingStore.shared.recordings.map { recording in
-            WebRecordingRow(
-                recording,
-                status: TranscriptionCoordinator.shared.status(for: recording)?.label)
-        }
+    private func library(_ request: HTTPRequest) -> HTTPResponse {
+        let (offset, limit) = pageBounds(request)
+        let recordings = RecordingStore.shared.recordings
         // Pinned at the top while it happens, so there is one list to look at
-        // rather than a separate mode for "the one that's happening now".
-        if let live = liveRecording() {
-            rows.insert(WebRecordingRow(live, status: "Recording"), at: 0)
+        // rather than a separate mode for "the one that's happening now". It
+        // occupies global index 0; stored recordings follow.
+        let live = liveRecording()
+        let hasLive = live != nil
+        let total = recordings.count + (hasLive ? 1 : 0)
+
+        // Map ONLY the requested window to rows. A12's point is to bound the
+        // serialize, so a WebRecordingRow is never built for a row outside the
+        // page.
+        let upper = min(offset + limit, total)
+        var items: [WebRecordingRow] = []
+        if offset < upper {
+            items.reserveCapacity(upper - offset)
+            for index in offset..<upper {
+                if hasLive, index == 0, let live {
+                    items.append(WebRecordingRow(live, status: "Recording"))
+                } else {
+                    let recording = recordings[index - (hasLive ? 1 : 0)]
+                    items.append(WebRecordingRow(
+                        recording,
+                        status: TranscriptionCoordinator.shared.status(for: recording)?.label))
+                }
+            }
         }
-        return .json(rows)
+        return .json(WebLibraryPage(items: items, total: total, offset: offset, limit: limit))
     }
 
     private func categories() -> HTTPResponse {
@@ -828,7 +890,20 @@ final class WebAPI {
         }
         summarizing.insert(job)
         Task { [weak self] in
+            // `defer` so the key is freed on *every* exit — a future throwing
+            // `generateSummary`, an early return, a cancellation — not only the
+            // clean-return path. Otherwise the recording+template pair returns
+            // 409 "already being generated" for the rest of the app's life.
+            defer { self?.summarizing.remove(job) }
             await self?.model.generateSummary(for: recording.id, template: template)
+        }
+        // Safety net for the one exit `defer` can't cover: an on-device model
+        // that wedges and never returns at all. Without this the key would stay
+        // in `summarizing` permanently. Idempotent with the removal above — a
+        // `Set.remove` of an absent key is a no-op — so a normal finish just
+        // clears it early and this fires against an empty set.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.summaryJobTimeout))
             self?.summarizing.remove(job)
         }
         return .json(["started": true], status: 202)

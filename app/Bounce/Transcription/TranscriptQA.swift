@@ -69,19 +69,14 @@ final class TranscriptQA {
         guard context != groundedOn else { return }
         groundedOn = context
 
-        let instructions = """
-        You answer questions about the transcript(s) below from the user's recordings. \
-        Base your answer on what the transcripts say. You may quote, summarize, or draw \
-        reasonable conclusions or inferences (for example, inferring the overall reason or purpose \
-        for a meeting from its main discussion points). Only say you don't know \
-        if the transcripts genuinely contain no relevant information.
-
-        Reply in plain, natural sentences — never JSON, key–value pairs, code, or \
-        markdown. Keep it concise and speak directly to the user.
-
-        TRANSCRIPT:
-        \(context)
-        """
+        // Routed through `PromptStore` so Settings › AI › Prompts can edit it;
+        // `PromptDefaults.qaGrounding` is the fallback for the impossible case of
+        // the catalogue having lost the id.
+        let values = ["transcript": context]
+        let edited = PromptStore.shared.filled(PromptID.qaGrounding, with: values)
+        let instructions = edited.isEmpty
+            ? PromptTemplating.filled(PromptDefaults.qaGrounding, with: values)
+            : edited
         let session = LanguageModelSession(instructions: instructions)
         session.prewarm()
         self.session = session

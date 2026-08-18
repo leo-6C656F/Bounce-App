@@ -222,7 +222,16 @@ final class TaskCalendarWriter {
     }
 
     private func resolvedTargetCalendar() -> EKCalendar? {
-        if let identifier = targetCalendarIdentifier,
+        Self.resolveTargetCalendar(in: store, identifier: targetCalendarIdentifier)
+    }
+
+    /// The create-target resolution, factored out so both the main-actor
+    /// `targetCalendar` picker property and the off-main `performSync` share one
+    /// rule. `nonisolated` so the sync pass can call it off the main actor.
+    nonisolated private static func resolveTargetCalendar(
+        in store: EKEventStore, identifier: String?
+    ) -> EKCalendar? {
+        if let identifier,
            let calendar = store.calendar(withIdentifier: identifier),
            calendar.allowsContentModifications {
             return calendar
@@ -253,13 +262,63 @@ final class TaskCalendarWriter {
         refreshAuthorizationStatus()
         guard canWriteEvents else { return .empty }
 
+        // Snapshot the main-actor state the reconciliation needs, then do every
+        // EventKit fetch/save/commit off the main actor. These calls block on the
+        // EventKit DB and used to run on main on *every foreground* — ~100 dated
+        // tasks meant N synchronous lookups plus a batched commit stalling the UI.
+        // The store is owned solely by this type and `sync` is called serially, so
+        // it's safe off-main; only Sendable values cross the hop, and the
+        // `@Published`/UserDefaults writes stay on main below.
+        let store = self.store
+        let lastPushedSnapshot = self.lastPushed
+        let forgottenSnapshot = self.forgotten
+        let targetId = self.targetCalendarIdentifier
+
+        guard let result = await Task.detached(priority: .utility, operation: {
+            Self.performSync(
+                store: store,
+                tasks: tasks,
+                lastPushed: lastPushedSnapshot,
+                forgotten: forgottenSnapshot,
+                targetCalendarIdentifier: targetId)
+        }).value else { return .empty }
+
+        // Write back on main. Only when the value actually changed, matching the
+        // previous conditional mutations — each assignment persists via `didSet`.
+        if result.forgotten != self.forgotten { self.forgotten = result.forgotten }
+        if result.lastPushed != self.lastPushed { self.lastPushed = result.lastPushed }
+        return result.outcome
+    }
+
+    /// The updated state the main actor must persist after a sync pass.
+    private struct SyncResult {
+        var outcome: TaskCalendarOutcome
+        var lastPushed: [String: Date]
+        var forgotten: Set<String>
+    }
+
+    /// The whole EventKit reconciliation, off the main actor. Returns `nil` only
+    /// when the store is unusable (mapped to `.empty` with no state change on main),
+    /// otherwise the outcome plus the new `lastPushed`/`forgotten` for the caller to
+    /// persist. Pure of `self`: everything it touches is passed in, which is what
+    /// makes it safe to run off the actor.
+    nonisolated private static func performSync(
+        store: EKEventStore,
+        tasks: [CalendarTask],
+        lastPushed: [String: Date],
+        forgotten: Set<String>,
+        targetCalendarIdentifier: String?
+    ) -> SyncResult? {
+        var lastPushed = lastPushed
+        var forgotten = forgotten
+
         // A store that can't answer must never be mistaken for an empty calendar.
         // `existing` is read by the planner as the complete truth about what
         // exists, so a blank read would unlink *and tombstone* every linked task at
         // once — unrecoverable short of toggling the setting off and on. Every
         // device with granted access has at least one event calendar, so an empty
         // list here means the store is not usable, not that the user has none.
-        guard !store.calendars(for: .event).isEmpty else { return .empty }
+        guard !store.calendars(for: .event).isEmpty else { return nil }
 
         // Resolved by identifier, one lookup per linked task, rather than by date
         // predicate. A predicate needs a window, and an event the user dragged
@@ -298,7 +357,7 @@ final class TaskCalendarWriter {
             // pass that had work to do.
             lastPushed = CalendarEventPlanning.nextLastPushed(
                 previous: lastPushed, existing: existing, removed: [], written: [:])
-            return .empty
+            return SyncResult(outcome: .empty, lastPushed: lastPushed, forgotten: forgotten)
         }
 
         // Bounce-side read-backs. These don't depend on anything reaching the
@@ -322,7 +381,8 @@ final class TaskCalendarWriter {
         var clearedItemIds: [String] = []
         var didWrite = false
 
-        if !plan.toCreate.isEmpty, let calendar = resolvedTargetCalendar() {
+        if !plan.toCreate.isEmpty,
+           let calendar = resolveTargetCalendar(in: store, identifier: targetCalendarIdentifier) {
             for task in plan.toCreate {
                 guard let deadline = task.item.dueDate else { continue }
                 let window = CalendarEventPlanning.window(endingAt: deadline)
@@ -376,7 +436,7 @@ final class TaskCalendarWriter {
                 // built are meaningless — drop them rather than storing dead links.
                 // The read-backs above still stand.
                 store.reset()
-                return outcome
+                return SyncResult(outcome: outcome, lastPushed: lastPushed, forgotten: forgotten)
             }
         }
 
@@ -395,7 +455,7 @@ final class TaskCalendarWriter {
             existing: existing,
             removed: removedEventIds,
             written: written)
-        return outcome
+        return SyncResult(outcome: outcome, lastPushed: lastPushed, forgotten: forgotten)
     }
 }
 

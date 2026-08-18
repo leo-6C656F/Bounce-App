@@ -60,7 +60,12 @@ struct RecordingDetailView: View {
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
+        // Resolve the store-backed recording once per `body` rather than paying a
+        // lookup at each of the ~30 references below. Every access re-reads the
+        // latest value because `body` re-runs on any observed change, so this is
+        // freshness-equivalent to the computed `current`, just not repeated.
+        let current = current
+        return ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     header
@@ -1077,13 +1082,21 @@ private struct SpeakerNamesSheet: View {
         recording.transcript?.speakers ?? []
     }
 
-    /// Attendees rank above the general history: they're evidence about *this*
-    /// meeting, where the directory is only a prior over all meetings.
-    private var suggestions: [String] {
-        let attendees = recording.calendarAttendees ?? []
-        let known = SpeakerDirectory.shared.suggestions.map(\.name)
+    /// Attendees of the linked meeting, deduped. Offered as their own group above
+    /// the general history: they're evidence about *this* recording, where the
+    /// directory is only a prior over every meeting. Empty when nothing is linked.
+    private var attendeeSuggestions: [String] {
         var seen = Set<String>()
-        return (attendees + known).filter { name in
+        return (recording.calendarAttendees ?? []).filter { name in
+            !name.isEmpty && seen.insert(name.lowercased()).inserted
+        }
+    }
+
+    /// Names the user has typed before, minus any already offered as an attendee
+    /// so no name appears in both groups.
+    private var knownSuggestions: [String] {
+        var seen = Set(attendeeSuggestions.map { $0.lowercased() })
+        return SpeakerDirectory.shared.suggestions.map(\.name).filter { name in
             !name.isEmpty && seen.insert(name.lowercased()).inserted
         }
     }
@@ -1135,29 +1148,12 @@ private struct SpeakerNamesSheet: View {
                     Text("Names apply to this recording only — the transcript can't recognize a voice across recordings.")
                 }
 
-                if !suggestions.isEmpty {
-                    Section {
-                        // Wraps rather than scrolls, so nothing is hidden off-edge at
-                        // large Dynamic Type.
-                        FlowRow(spacing: 8) {
-                            ForEach(suggestions, id: \.self) { name in
-                                Button(name) {
-                                    guard let focused else { return }
-                                    names[focused] = name
-                                }
-                                .buttonStyle(.glass)
-                                .controlSize(.small)
-                                .disabled(focused == nil)
-                            }
-                        }
-                    } header: {
-                        Text("Names you've used")
-                    } footer: {
-                        Text(focused == nil
-                            ? "Tap a speaker field above, then tap a name to fill it."
-                            : "Filling \(label(for: focused!)).")
-                    }
-                }
+                // Attendees of the linked meeting first — they're about this
+                // recording — then the general name pool. Split into labelled
+                // groups so an attendee the user has never typed isn't misfiled
+                // under "Names you've used".
+                chipSection(attendeeSuggestions, header: "Meeting attendees")
+                chipSection(knownSuggestions, header: "Names you've used")
             }
             .navigationTitle("Name speakers")
             .toolbarTitleDisplayMode(.inline)
@@ -1182,6 +1178,37 @@ private struct SpeakerNamesSheet: View {
 
     private func label(for speaker: String) -> String {
         Int(speaker) != nil ? "Speaker \(speaker)" : speaker
+    }
+
+    /// One tap-to-fill group of name chips, headed by `header`. Shared by the
+    /// attendee group and the used-names group so they stay visually identical and
+    /// carry the same "tap a field first" guidance — the only difference is which
+    /// names they hold and what they're called.
+    @ViewBuilder
+    private func chipSection(_ chips: [String], header: LocalizedStringKey) -> some View {
+        if !chips.isEmpty {
+            Section {
+                // Wraps rather than scrolls, so nothing is hidden off-edge at
+                // large Dynamic Type.
+                FlowRow(spacing: 8) {
+                    ForEach(chips, id: \.self) { chip in
+                        Button(chip) {
+                            guard let focused else { return }
+                            names[focused] = chip
+                        }
+                        .buttonStyle(.glass)
+                        .controlSize(.small)
+                        .disabled(focused == nil)
+                    }
+                }
+            } header: {
+                Text(header)
+            } footer: {
+                Text(focused == nil
+                    ? "Tap a speaker field above, then tap a name to fill it."
+                    : "Filling \(label(for: focused!)).")
+            }
+        }
     }
 
     private func seed() {

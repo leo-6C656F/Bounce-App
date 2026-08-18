@@ -317,6 +317,27 @@ struct Summary: Codable, Hashable, Identifiable {
     var id: String { templateId }
 }
 
+/// Who chose a recording's current title.
+///
+/// The distinction exists so a **manual** calendar link can adopt the meeting's
+/// name over a title the app picked, while never clobbering one the user typed.
+/// It is not derivable after the fact — an AI title and a hand-typed one are both
+/// just strings — so it has to be recorded when the title is set.
+///
+/// Deliberately only two cases, and no `.calendar`: a calendar-derived title is
+/// still an automatic one for this purpose (the app chose it, the user didn't),
+/// so it is `.auto` and stays adoptable. `nil` is the legacy state — every
+/// recording titled before this field existed — and is treated as `.user`
+/// (preserve), because silently overwriting a title has no undo whereas the
+/// Meeting card's "Use meeting name" gives one-tap adoption on demand.
+enum RecordingTitleSource: String, Codable {
+    /// The user typed this title by hand. Never overwritten on a link.
+    case user
+    /// The app chose it — an AI summary title or a calendar meeting name.
+    /// Adopted by a later manual link, since the user never claimed it.
+    case auto
+}
+
 /// A recording that lives on this iPhone.
 ///
 /// `audioFilename` is stored **relative** to the Documents directory on
@@ -329,6 +350,10 @@ struct Recording: Identifiable, Codable, Hashable {
     let sessionId: Int
     let deviceSN: String
     var title: String
+    /// Who chose `title` — the user, or the app. See `RecordingTitleSource`.
+    /// Optional so older libraries decode; `nil` (legacy) is treated as the
+    /// user's, so a manual meeting link never silently overwrites it.
+    var titleSource: RecordingTitleSource?
     var duration: TimeInterval
     let createdAt: Date
     var syncedAt: Date?
@@ -488,7 +513,7 @@ struct Recording: Identifiable, Codable, Hashable {
     /// **Every stored property has to be listed here** — add new ones as you add
     /// fields, or they silently stop being saved.
     private enum CodingKeys: String, CodingKey {
-        case id, sessionId, deviceSN, title, duration, createdAt, syncedAt
+        case id, sessionId, deviceSN, title, titleSource, duration, createdAt, syncedAt
         case audioFilename, transcript, livePreview, highlights, summaries
         case speakerNames, categoryName, actionItems, tagIds
         case calendarEventTitle, calendarAttendees, calendarLinkConfirmed, agenda, place
@@ -506,6 +531,7 @@ struct Recording: Identifiable, Codable, Hashable {
         sessionId: Int,
         deviceSN: String,
         title: String = Recording.untitled,
+        titleSource: RecordingTitleSource? = nil,
         duration: TimeInterval = 0,
         createdAt: Date,
         syncedAt: Date? = nil,
@@ -533,6 +559,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.sessionId = sessionId
         self.deviceSN = deviceSN
         self.title = title
+        self.titleSource = titleSource
         self.duration = duration
         self.createdAt = createdAt
         self.syncedAt = syncedAt
@@ -576,5 +603,47 @@ struct Recording: Identifiable, Codable, Hashable {
         return h > 0
             ? String(format: "%d:%02d:%02d", h, m, s)
             : String(format: "%d:%02d", m, s)
+    }
+}
+
+// MARK: - Search haystack
+
+extension Recording {
+    /// The transcript text, joined and lowercased once, for case-insensitive
+    /// substring search across the library and Ask.
+    ///
+    /// This is the expensive half of search: `Transcript.plainText` re-joins
+    /// every segment and `.lowercased()` allocates a second full copy of the
+    /// whole transcript. Library search used to do both **per keystroke, per
+    /// recording, on the main thread** (S-8), and Ask did the same on tap (S-9).
+    /// `RecordingSearchIndex` caches this string keyed by `searchIdentity`, so it
+    /// is built once and reused until the transcript changes.
+    ///
+    /// Titles are *not* included: `displayTitle.lowercased()` is trivially cheap,
+    /// changes independently of the transcript, and only the Library search
+    /// matches on it — Ask matches on transcript text alone. Keeping the title out
+    /// lets both share one haystack.
+    ///
+    /// Pure and Foundation-only, so `Recording.swift` still compiles standalone in
+    /// `tools/library-decode-tests`. The caching lives in `RecordingSearchIndex`.
+    var searchHaystack: String {
+        transcript?.plainText.lowercased() ?? ""
+    }
+
+    /// A cheap token that changes exactly when `searchHaystack` would, so the
+    /// index can reuse a cached haystack across keystrokes and rebuild only when
+    /// the transcript actually changed.
+    ///
+    /// Deliberately does **not** hash the transcript text — that would cost as
+    /// much as building the haystack it guards. Instead it combines fields that
+    /// move with any content change: the transcript's `createdAt` (a fresh one is
+    /// stamped by the post-sync pass that replaces a live preview), the segment
+    /// count (grows live, changes on re-transcribe), and the summed character
+    /// count (catches in-place edits like correct-a-word). The character sum
+    /// iterates segments without allocating the joined string.
+    var searchIdentity: String {
+        guard let transcript else { return "\u{2205}" }
+        let chars = transcript.segments.reduce(0) { $0 + $1.text.count }
+        return "\(transcript.createdAt.timeIntervalSinceReferenceDate)#\(transcript.segments.count)#\(chars)"
     }
 }

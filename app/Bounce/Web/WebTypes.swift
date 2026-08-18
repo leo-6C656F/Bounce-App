@@ -58,6 +58,22 @@ struct WebBlock: Encodable {
 
 // MARK: - Library
 
+/// A page of library/search rows plus the counters a client needs to walk the
+/// rest.
+///
+/// Introduced with pagination (A12): `/api/library` and `/api/search` used to
+/// return a bare `[WebRecordingRow]`, so a library of thousands of recordings was
+/// one unbounded JSON blob serialized on the main actor and parsed by the browser
+/// in one go. The envelope bounds each response to `limit` rows and reports
+/// `total` so a client knows when it has them all. `offset`/`limit` echo what was
+/// served, since both are clamped server-side.
+struct WebLibraryPage: Encodable {
+    let items: [WebRecordingRow]
+    let total: Int
+    let offset: Int
+    let limit: Int
+}
+
 /// One row in the desktop library list. Deliberately excludes transcript text —
 /// a library of long meetings would otherwise be megabytes per refresh.
 struct WebRecordingRow: Encodable {

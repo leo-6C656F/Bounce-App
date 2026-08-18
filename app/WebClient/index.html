@@ -68,7 +68,12 @@
     --raised: light-dark(#ffffff, var(--night-800));
     --text: light-dark(#1b1c21, #edeef2);
     --text-dim: light-dark(#585a63, #9aa0ac);
-    --text-faint: light-dark(#8e8b85, #646a76);
+    /* Darkened (light) / lightened (dark) to clear the WCAG AA 4.5:1 floor for
+       small text — this token carries row meta, timecodes, counts and help
+       sub-text at ≤0.75rem. The old #8e8b85 / #646a76 sat near ~3:1 on --page /
+       --surface. These clear 4.5:1 on --page, --surface and --raised in both
+       schemes while staying visibly fainter than --text-dim. (B5) */
+    --text-faint: light-dark(#6d6a63, #868c98);
     --rule: light-dark(var(--paper-200), #21252e);
     --rule-strong: light-dark(var(--paper-300), #363c48);
     --accent: light-dark(var(--violet-600), var(--violet-400));
@@ -769,12 +774,10 @@
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
   .ask-hero-header { display: flex; align-items: center; gap: var(--s-3); margin-block-end: var(--s-1); }
-  .ask-hero-icon {
-    display: inline-grid; place-items: center; width: 34px; height: 34px;
-    border-radius: 50%; background: rgba(90, 146, 202, 0.15); font-size: 1.1rem;
-  }
-  .ask-hero-title { font-size: var(--step-1); font-weight: 600; margin: 0; }
-  .ask-hero-sub { font-size: var(--step--1); color: var(--text-faint); margin: 0; }
+  .ask-hero .eyebrow { display: block; margin-block-end: var(--s-1); }
+  .ask-hero-title { font-size: var(--step-2); font-weight: 600; letter-spacing: -0.01em; margin: 0; }
+  .ask-hero-title:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+  .ask-hero-sub { font-size: var(--step--1); color: var(--text-dim); margin-block-start: var(--s-1); }
 
   .prompt-chips-label {
     font-size: var(--step--2); text-transform: uppercase; letter-spacing: 0.05em;
@@ -939,7 +942,7 @@
   .set-wrap { padding-block: var(--s-6) var(--s-7); }
 
   .set-head { display: flex; align-items: baseline; gap: var(--s-3); flex-wrap: wrap; }
-  .set-head h2 { font: 600 var(--step-2)/1.15 var(--font-read); letter-spacing: -0.015em; }
+  .set-head h1 { font: 600 var(--step-2)/1.15 var(--font-read); letter-spacing: -0.015em; }
   /* Reads "Saving…" while a write is in flight and is empty otherwise. It is
      the same element across every rebuild — a live region recreated with its
      text already in it is not reliably announced, so this one is moved rather
@@ -1424,10 +1427,10 @@
     <span class="wordmark"><svg class="logo" width="20" height="20" aria-hidden="true"><use href="#logoMark"/></svg>Bounce</span>
 
     <div class="tabs" role="tablist" aria-label="Views">
-      <button role="tab" id="tabLibrary" aria-selected="true" aria-controls="reader">Library</button>
-      <button role="tab" id="tabAsk" aria-selected="false" aria-controls="askView">Ask</button>
-      <button role="tab" id="tabSettings" aria-selected="false" aria-controls="settingsView">Settings</button>
-      <button role="tab" id="tabDocs" aria-selected="false" aria-controls="docsView">API</button>
+      <button role="tab" id="tabLibrary" aria-selected="true" aria-controls="reader" tabindex="0">Library</button>
+      <button role="tab" id="tabAsk" aria-selected="false" aria-controls="askView" tabindex="-1">Ask</button>
+      <button role="tab" id="tabSettings" aria-selected="false" aria-controls="settingsView" tabindex="-1">Settings</button>
+      <button role="tab" id="tabDocs" aria-selected="false" aria-controls="docsView" tabindex="-1">API</button>
     </div>
 
     <div class="rail-status">
@@ -1454,7 +1457,8 @@
     <div id="rows"></div>
   </aside>
 
-  <section id="reader" aria-label="Recording">
+  <section id="reader" role="tabpanel" aria-labelledby="tabLibrary" tabindex="-1">
+    <h1 class="vh" id="readerHeading">Library</h1>
     <div class="reader-head frame indent" id="readerHead" hidden></div>
     <div class="reader-body" id="readerBody"></div>
     <div class="transport" id="transport" hidden></div>
@@ -1462,34 +1466,23 @@
 
   <!-- Ask across the library. Same on-device model as the phone; the question
        goes to the iPhone and the answer streams back. -->
-  <section id="askView" hidden aria-label="Ask">
+  <section id="askView" hidden role="tabpanel" aria-labelledby="tabAsk" tabindex="-1">
     <div class="ask-wrap frame indent">
       <div class="ask-hero">
         <div class="ask-hero-header">
-          <span class="ask-hero-icon">✨</span>
           <div>
-            <h2 class="ask-hero-title">Ask Apple Intelligence</h2>
-            <p class="ask-hero-sub">On-device search across your library · Private</p>
+            <span class="eyebrow">Ask · on device</span>
+            <h1 class="ask-hero-title" id="askHeading" tabindex="-1">Ask your library</h1>
+            <p class="ask-hero-sub">Questions answered on your iPhone by Apple Intelligence — nothing is uploaded.</p>
           </div>
         </div>
-        <p style="font-size: var(--step--1); color: var(--text-dim); margin-block-start: var(--s-2);">
-          Ask questions across all your transcripts, extract action items, or summarize discussions.
-        </p>
 
         <div class="prompt-chips-label">Try asking</div>
         <div class="prompt-chips" id="askChips">
-          <button class="chip" data-query="What action items were assigned?">
-            <span class="chip-icon">⚡</span> Action items
-          </button>
-          <button class="chip" data-query="What were the key decisions made?">
-            <span class="chip-icon">🎯</span> Key decisions
-          </button>
-          <button class="chip" data-query="Summarize recent discussions">
-            <span class="chip-icon">📝</span> Meeting summary
-          </button>
-          <button class="chip" data-query="Were any deadlines or dates mentioned?">
-            <span class="chip-icon">📌</span> Deadlines &amp; dates
-          </button>
+          <button class="chip" data-query="What action items were assigned?">Action items</button>
+          <button class="chip" data-query="What were the key decisions made?">Key decisions</button>
+          <button class="chip" data-query="Summarize recent discussions">Meeting summary</button>
+          <button class="chip" data-query="Were any deadlines or dates mentioned?">Deadlines &amp; dates</button>
         </div>
       </div>
 
@@ -1506,9 +1499,9 @@
     </div>
   </section>
 
-  <section id="settingsView" hidden aria-label="Settings"></section>
+  <section id="settingsView" hidden role="tabpanel" aria-labelledby="tabSettings" tabindex="-1"></section>
 
-  <section id="docsView" hidden aria-label="API and MCP reference"></section>
+  <section id="docsView" hidden role="tabpanel" aria-labelledby="tabDocs" tabindex="-1"></section>
 
 </div>
 
@@ -1548,6 +1541,17 @@ function logoEl(size) {
   use.setAttribute("href", "#logoMark");
   svg.append(use);
   return svg;
+}
+
+/** Trailing debounce — coalesce a burst of calls into one, `wait` ms after the
+ *  last. Used to keep per-keystroke work (the full library rebuild) off the
+ *  critical path. */
+function debounce(fn, wait) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), wait);
+  };
 }
 
 let toastTimer;
@@ -1707,7 +1711,7 @@ function connectEvents() {
   source.onmessage = (event) => {
     let payload;
     try { payload = JSON.parse(event.data); } catch (_) { return; }
-    if (payload.type === "library") { refreshLibrary(); refreshCategories(); refreshTemplates(); }
+    if (payload.type === "library") onLibraryEvent();
     else if (payload.type === "status") renderStatus(payload);
     else if (payload.type === "live") renderLive(payload);
     else if (payload.type === "unauthorized") { source.close(); showPairing(); }
@@ -1722,16 +1726,25 @@ function connectEvents() {
 }
 
 let reconnectTimer = null;
+let reconnectDelay = 0;
+const RECONNECT_MIN_MS = 3000, RECONNECT_MAX_MS = 60000;
 function scheduleReconnect(deadSource) {
   if (reconnectTimer) return;
-  reconnectTimer = setInterval(async () => {
-    if (state.events !== deadSource) { clearInterval(reconnectTimer); reconnectTimer = null; return; }
+  // Exponential backoff to a ceiling (A9), rather than polling `/api/session`
+  // every 3 s forever while the phone is away — indefinite network churn and log
+  // noise on the browser. Any successful poll resets to the floor.
+  reconnectDelay = reconnectDelay ? Math.min(reconnectDelay * 2, RECONNECT_MAX_MS) : RECONNECT_MIN_MS;
+  reconnectTimer = setTimeout(async () => {
+    reconnectTimer = null;
+    if (state.events !== deadSource) { reconnectDelay = 0; return; }
     try {
       const session = await fetch("/api/session", { credentials: "same-origin" }).then((r) => r.json());
-      clearInterval(reconnectTimer); reconnectTimer = null;
+      reconnectDelay = 0;
       if (session.paired) { connectEvents(); refreshAll(); } else { showPairing(); }
-    } catch (_) { /* still down — keep polling */ }
-  }, 3000);
+    } catch (_) {
+      scheduleReconnect(deadSource);   // still down — try again, longer this time
+    }
+  }, reconnectDelay);
 }
 
 function setDevice(dotState, text) {
@@ -1745,13 +1758,44 @@ function renderStatus(status) {
 }
 
 /* ── Tabs ─────────────────────────────────────────────────── */
-for (const tab of document.querySelectorAll('[role="tab"]')) {
+/* Scoped to the top `.tabs`, deliberately NOT `document.querySelectorAll(
+   '[role="tab"]')`: the reader's own view tablist (Transcript/Summaries/…) also
+   carries `role="tab"`, and a document-wide query would clobber its selection. */
+const mainTablist = $(".tabs");
+const mainTabButtons = () => Array.from(mainTablist.querySelectorAll('[role="tab"]'));
+for (const tab of mainTabButtons()) {
   tab.addEventListener("click", () => selectTab(tab.id));
 }
+// B3: Left/Right/Home/End move between tabs with a roving tabindex, and
+// activation follows focus (automatic-activation tablist).
+mainTablist.addEventListener("keydown", (event) =>
+  rovingTabKeydown(event, mainTabButtons(), (tab) => selectTab(tab.id)));
+
+/** Shared keyboard model for a `role="tablist"`: arrow/Home/End move focus with a
+ *  roving tabindex, and `activate` is called on the newly focused tab (pass a
+ *  no-op for manual-activation tablists, where the button's own click activates). */
+function rovingTabKeydown(event, tabs, activate) {
+  const current = tabs.indexOf(document.activeElement);
+  if (current === -1) return;
+  let next;
+  if (event.key === "ArrowRight" || event.key === "ArrowDown") next = (current + 1) % tabs.length;
+  else if (event.key === "ArrowLeft" || event.key === "ArrowUp") next = (current - 1 + tabs.length) % tabs.length;
+  else if (event.key === "Home") next = 0;
+  else if (event.key === "End") next = tabs.length - 1;
+  else return;
+  event.preventDefault();
+  for (const tab of tabs) tab.tabIndex = -1;
+  tabs[next].tabIndex = 0;
+  tabs[next].focus();
+  activate(tabs[next]);
+}
+
 function selectTab(id) {
   withTransition(() => {
-    for (const tab of document.querySelectorAll('[role="tab"]')) {
-      tab.setAttribute("aria-selected", String(tab.id === id));
+    for (const tab of mainTabButtons()) {
+      const selected = tab.id === id;
+      tab.setAttribute("aria-selected", String(selected));
+      tab.tabIndex = selected ? 0 : -1;   // roving tabindex
     }
     $("#reader").hidden = id !== "tabLibrary";
     $("#askView").hidden = id !== "tabAsk";
@@ -1765,9 +1809,17 @@ function selectTab(id) {
     // The library list is only meaningful next to the reader. Collapse its grid
     // column too, or Ask and Live sit off-centre against an empty gutter.
     $("#app").dataset.solo = String(id !== "tabLibrary");
-    // Inside the update, not after it: `startViewTransition` runs the callback
-    // async, so focusing outside would land on a still-hidden input.
+    // B6: move focus into the revealed pane so keyboard/SR users follow the
+    // change instead of being stranded on the tab. Ask keeps input focus — its
+    // whole purpose is to type a question — the others focus their panel, a
+    // labelled `role="tabpanel"` that announces its name. Inside the update, not
+    // after it: `startViewTransition` runs the callback async, so focusing
+    // outside would land on a still-hidden element.
     if (id === "tabAsk") $("#askInput").focus();
+    else {
+      const controls = document.getElementById(id)?.getAttribute("aria-controls");
+      if (controls) document.getElementById(controls)?.focus();
+    }
   });
 }
 
@@ -1778,17 +1830,49 @@ async function refreshAll() {
   // dot by category — repaint once everything is in.
   renderRows();
 }
+/* The library arrives in pages (`{items,total,offset,limit}`) rather than one
+   unbounded blob, so the phone serializes a bounded slice per request instead of
+   the whole library at once (A12). We accumulate every page before rendering —
+   the client's day grouping, filters and search all operate over the full set —
+   but each fetch is small, and the phone's main actor is never handed thousands
+   of rows to encode in one go. */
+const LIBRARY_PAGE_LIMIT = 500;
+async function fetchLibraryPages() {
+  const items = [];
+  let offset = 0;
+  for (;;) {
+    const page = await api(`/api/library?offset=${offset}&limit=${LIBRARY_PAGE_LIMIT}`);
+    // Tolerate an older server that returns a bare array (no version skew in
+    // practice — client and server ship together — but cheap insurance).
+    if (Array.isArray(page)) return page;
+    items.push(...page.items);
+    offset += page.items.length;
+    if (!page.items.length || offset >= page.total) break;
+  }
+  return items;
+}
+
+let libraryRefreshInFlight = null;
 async function refreshLibrary({ skipDetail = false } = {}) {
-  try {
-    state.library = await api("/api/library");
-    // A recording deleted on the phone would otherwise leave a stale but
-    // fully interactive reader: the refetch 404s and the error is swallowed.
-    if (state.selectedId && !state.library.some((r) => r.id === state.selectedId)) {
-      select(null);
+  // A17-adjacent: a burst of `library` events (live auto-save, auto-summary)
+  // must not fan out to a stampede of overlapping full walks. Coalesce onto one
+  // in-flight refresh; callers awaiting it all see the same fresh result.
+  if (libraryRefreshInFlight) return libraryRefreshInFlight;
+  libraryRefreshInFlight = (async () => {
+    try {
+      state.library = await fetchLibraryPages();
+      // A recording deleted on the phone would otherwise leave a stale but
+      // fully interactive reader: the refetch 404s and the error is swallowed.
+      if (state.selectedId && !state.library.some((r) => r.id === state.selectedId)) {
+        select(null);
+      }
+      renderRows();
+      if (state.selectedId && !skipDetail) loadDetail(state.selectedId, { quiet: true });
+    } catch (_) {} finally {
+      libraryRefreshInFlight = null;
     }
-    renderRows();
-    if (state.selectedId && !skipDetail) loadDetail(state.selectedId, { quiet: true });
-  } catch (_) {}
+  })();
+  return libraryRefreshInFlight;
 }
 async function refreshCategories() {
   try {
@@ -1805,7 +1889,20 @@ async function refreshTemplates() {
   try { state.templates = await api("/api/templates"); } catch (_) {}
 }
 
-$("#search").addEventListener("input", renderRows);
+/* A7: a single phone-side write (live auto-save, auto-summary) can emit a burst
+   of `library` events, each of which used to fan straight out to three full
+   GETs. Debounce the fanout so a burst collapses into one refresh cycle; the
+   library walk itself additionally coalesces in `refreshLibrary`. */
+const onLibraryEvent = debounce(() => {
+  refreshLibrary();
+  refreshCategories();
+  refreshTemplates();
+}, 250);
+
+// Debounced: `renderRows` runs the whole filtered rebuild, so firing it on every
+// keystroke is wasted work a large library feels. ~150 ms trails the typist
+// without perceptible lag. The category filter changes rarely, so it stays live.
+$("#search").addEventListener("input", debounce(renderRows, 150));
 $("#catFilter").addEventListener("change", renderRows);
 document.addEventListener("keydown", (event) => {
   // Not while a popover owns the screen: `/` would yank focus out to the search
@@ -1842,12 +1939,27 @@ function renderRows() {
     return;
   }
 
-  const longest = Math.max(...rows.map((r) => r.duration || 0), 1);
+  // A4: reduce, not `Math.max(...spread)` — spreading a very large array as call
+  // arguments can throw `RangeError: too many arguments` in some engines.
+  const longest = rows.reduce((m, r) => Math.max(m, r.duration || 0), 1);
+
+  // A1: one pass to count rows per day and cache each row's day key, so the
+  // per-row header doesn't re-scan (and re-`new Date()`) the whole list — that
+  // was O(N²) with millions of Date allocations on a large library.
+  const dayKeys = new Array(rows.length);
+  const dayCounts = new Map();
+  for (let i = 0; i < rows.length; i++) {
+    const key = dayKey(rows[i].createdAt);
+    dayKeys[i] = key;
+    dayCounts.set(key, (dayCounts.get(key) || 0) + 1);
+  }
+
   let day = null;
-  for (const row of rows) {
-    if (dayKey(row.createdAt) !== day) {
-      day = dayKey(row.createdAt);
-      const count = rows.filter((r) => dayKey(r.createdAt) === day).length;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    if (dayKeys[i] !== day) {
+      day = dayKeys[i];
+      const count = dayCounts.get(day);
       container.append(el("div", { class: "day-head" }, [
         el("span", { class: "eyebrow", text: dayLabel(row.createdAt) }),
         el("span", { class: "rule" }),
@@ -1864,7 +1976,15 @@ function renderRows() {
     const swatch = categorySwatch(row.categoryName);
     container.append(el("button", {
       class: "row", "aria-current": row.id === state.selectedId ? "true" : null,
-      onclick: () => { select(row.id); if (matchMedia("(width < 56rem)").matches) $("#app").dataset.pane = "reader"; },
+      onclick: () => {
+        select(row.id);
+        // On a phone-width layout the reader replaces the list; move focus to it
+        // (a `tabindex="-1"` panel) so keyboard/SR users follow the reveal (B6).
+        if (matchMedia("(width < 56rem)").matches) {
+          $("#app").dataset.pane = "reader";
+          $("#reader").focus();
+        }
+      },
     }, [
       el("div", { class: "row-title", text: row.title }),
       el("div", { class: "row-meta" }, [
@@ -1931,6 +2051,12 @@ function renderReader() {
 
   const rec = state.detail;
   head.textContent = ""; body.textContent = "";
+  // A5: the speakers popover is appended to <body>, not into the reader pane that
+  // gets wiped above, so without this each render would leak another node with
+  // the same id — and `popovertarget="speakerPop"` resolves to the oldest, stalest
+  // one. Remove it here; `renderDetails` re-creates it when the recording has
+  // voices to name.
+  document.getElementById("speakerPop")?.remove();
 
   if (!rec) {
     head.hidden = true;
@@ -2013,27 +2139,43 @@ function renderHead(head, rec) {
         ["details", "Details", 0],
       ];
   for (const [key, label, count] of tabs) {
+    const selected = state.view === key;
     views.append(el("button", {
-      role: "tab", "aria-selected": String(state.view === key),
+      role: "tab", "aria-selected": String(selected), tabindex: selected ? "0" : "-1",
+      "data-view": key,
       onclick: () => { state.view = key; withTransition(renderReader); },
     }, [
       document.createTextNode(label),
       count ? el("span", { class: "count", text: String(count) }) : null,
     ]));
   }
+  // B3: arrow keys move focus with a roving tabindex. Manual activation here
+  // (Enter/Space/click, which the button fires natively) rather than
+  // follow-focus, because activating rebuilds the whole reader head.
+  views.addEventListener("keydown", (event) =>
+    rovingTabKeydown(event, Array.from(views.querySelectorAll('[role="tab"]')), () => {}));
   head.append(views);
 }
 
 /** Rename one voice from its label in the transcript margin. */
-function renameSpeaker(rec, speakerId, shown) {
+async function renameSpeaker(rec, speakerId, shown) {
   if (!speakerId) return;
-  const entered = prompt(`Name for ${shown}:`, rec.speakerNames[speakerId] || "");
+  // Through the non-blocking <dialog>, not `prompt()` (A6/B2): a blocking OS
+  // prompt freezes the event loop, and the settings code already documents that
+  // a blocked page stalls the live channel and can trip the server's keepalive.
+  // `settingsPrompt` returns the trimmed string, or null if cancelled/Esc.
+  const entered = await settingsPrompt({
+    title: `Name ${shown}`,
+    body: "This name replaces the speaker label throughout this transcript.",
+    value: rec.speakerNames[speakerId] || "",
+    placeholder: shown,
+    confirmLabel: "Save",
+  });
   if (entered === null) return;                      // cancelled
   const names = { ...rec.speakerNames };
-  const trimmed = entered.trim();
   // Empty clears the name; the server drops blank values, falling back to
   // "Speaker N".
-  if (trimmed) names[speakerId] = trimmed; else delete names[speakerId];
+  if (entered) names[speakerId] = entered; else delete names[speakerId];
   save("speakers", { names });
 }
 
@@ -2104,34 +2246,8 @@ function renderTranscript(body, rec) {
   let lastSpeaker = null;
   let index = 0;
   for (const block of rec.blocks) {
-    const same = block.speaker !== null && block.speaker === lastSpeaker;
+    spine.append(buildTurn(rec, block, lastSpeaker, { entering, index }));
     lastSpeaker = block.speaker;
-    spine.append(el("div", {
-      class: "turn", "data-start": block.start, "data-same": same ? "true" : null,
-      // Stagger only the opening screenful, and only when this recording was
-      // just opened. A live recording re-renders several times a second, and
-      // re-applying the animation each time left the text permanently stuck
-      // part-way through its fade-in.
-      style: entering && index < 8 ? `--enter:${index * 40}ms` : null,
-      "data-enter": entering && index < 8 ? "true" : null,
-    }, [
-      el("div", { class: "tc-cell" }, [
-        same || !block.speaker ? null : el("button", {
-          class: "who", text: block.speaker,
-          title: `Rename ${block.speaker}`,
-          // Keyed by `speakerId`, the diarization label ("1"), NOT by the
-          // displayed name — `Recording.speakerNames` maps id → name, so keying
-          // by the display string writes an entry the phone will never read.
-          onclick: () => renameSpeaker(rec, block.speakerId, block.speaker),
-        }),
-        el("button", {
-          class: "tc", text: block.timecode,
-          "aria-label": `Play from ${block.timecode}`,
-          onclick: () => seek(block.start, true),
-        }),
-      ]),
-      el("div", { class: "say" }, [saidParagraph(block)]),
-    ]));
     index += 1;
   }
   // The words still being heard, hanging off the same margin.
@@ -2151,6 +2267,45 @@ function renderTranscript(body, rec) {
   } else {
     body.onscroll = null;
   }
+}
+
+/**
+ * One transcript turn: the timecode/speaker gutter cell and the paragraph.
+ *
+ * Extracted so the full render (`renderTranscript`) and the incremental live
+ * update (`applyLiveDelta`) build a turn identically — a live delta replaces only
+ * the changed suffix, and a turn that rendered differently there would make the
+ * transcript flicker between the two paths.
+ *
+ * `prevSpeaker` is the displayed speaker of the block above, so a run of turns by
+ * one voice suppresses the repeated label. The stagger animation only plays on
+ * the opening screenful of a freshly-opened recording (`entering`), never on a
+ * live re-render.
+ */
+function buildTurn(rec, block, prevSpeaker, { entering = false, index = 0 } = {}) {
+  const same = block.speaker !== null && block.speaker === prevSpeaker;
+  return el("div", {
+    class: "turn", "data-start": block.start, "data-same": same ? "true" : null,
+    style: entering && index < 8 ? `--enter:${index * 40}ms` : null,
+    "data-enter": entering && index < 8 ? "true" : null,
+  }, [
+    el("div", { class: "tc-cell" }, [
+      same || !block.speaker ? null : el("button", {
+        class: "who", text: block.speaker,
+        title: `Rename ${block.speaker}`,
+        // Keyed by `speakerId`, the diarization label ("1"), NOT by the
+        // displayed name — `Recording.speakerNames` maps id → name, so keying
+        // by the display string writes an entry the phone will never read.
+        onclick: () => renameSpeaker(rec, block.speakerId, block.speaker),
+      }),
+      el("button", {
+        class: "tc", text: block.timecode,
+        "aria-label": `Play from ${block.timecode}`,
+        onclick: () => seek(block.start, true),
+      }),
+    ]),
+    el("div", { class: "say" }, [saidParagraph(block)]),
+  ]);
 }
 
 /**
@@ -2343,7 +2498,15 @@ async function post(action, body, message) {
   } catch (error) { toast(error.message); }
 }
 async function remove(rec) {
-  if (!confirm(`Delete “${rec.title}”? This also removes the audio from your iPhone.`)) return;
+  // The styled, non-blocking dialog rather than `confirm()` (A6/B2) — same
+  // reason as `renameSpeaker`: a blocking dialog stalls the live SSE channel.
+  const agreed = await settingsConfirm({
+    title: "Delete recording",
+    body: `Delete “${rec.title}”? This also removes the audio from your iPhone.`,
+    confirmLabel: "Delete",
+    danger: true,
+  });
+  if (!agreed) return;
   try {
     await api(`/api/recordings/${encodeURIComponent(rec.id)}`, { method: "DELETE" });
     select(null);
@@ -2587,12 +2750,29 @@ function markCurrentTurn() {
     if (spokenPhrase) delete spokenPhrase.dataset.now;
     if (spoken) {
       spoken.dataset.now = "true";
-      // Follow the phrase rather than the whole turn — a minute-long block
-      // scrolled to centre leaves the words being spoken off-screen.
-      spoken.scrollIntoView({ block: "center", behavior: "smooth" });
+      // A8: only scroll when the phrase isn't already in view, and honour
+      // reduced-motion. Firing a smooth scroll on every phrase change — several
+      // times a block — queued animations that fought a user who had scrolled
+      // away to read elsewhere. Follow the phrase rather than the whole turn: a
+      // minute-long block centred leaves the words being spoken off-screen.
+      const container = $("#readerBody");
+      if (!phraseInView(spoken, container)) {
+        const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+        spoken.scrollIntoView({ block: "center", behavior: reduce ? "auto" : "smooth" });
+      }
     }
     spokenPhrase = spoken;
   }
+}
+
+/** Whether `node` is fully within the scroll container's visible band. Used to
+ *  suppress redundant follow-scrolls (A8). */
+function phraseInView(node, container) {
+  const nr = node.getBoundingClientRect();
+  const cr = container
+    ? container.getBoundingClientRect()
+    : { top: 0, bottom: window.innerHeight || document.documentElement.clientHeight };
+  return nr.top >= cr.top && nr.bottom <= cr.bottom;
 }
 
 /* ── Ask ──────────────────────────────────────────────────────
@@ -2612,7 +2792,15 @@ function askAbort() {
  * @param out       container to render into
  * @param button    submit button, disabled while answering
  */
+/** The server rejects a question over this; EventSource can't POST, so a very
+ *  long one would also risk the request-line limit. Cap client-side with a clear
+ *  message rather than letting it 4xx (A11). */
+const ASK_MAX_CHARS = 500;
 function runAsk(question, url, out, button) {
+  if (question.length > ASK_MAX_CHARS) {
+    toast(`That question is too long — keep it under ${ASK_MAX_CHARS} characters.`);
+    return;
+  }
   askAbort();
   out.textContent = "";
 
@@ -2701,15 +2889,15 @@ function renderAsk(body, rec) {
   }
 
   const input = el("input", { class: "field", type: "text", autocomplete: "off",
-    id: "recAskInput", placeholder: "What did they decide?", "aria-label": "Ask about this recording" });
+    id: "recAskInput", maxlength: "500", placeholder: "What did they decide?", "aria-label": "Ask about this recording" });
   const go = el("button", { class: "btn primary", type: "submit", text: "Ask" });
   const out = el("div", { id: "recAskOut" });
 
   const recSuggestions = [
-    { label: "Action items", icon: "⚡", query: "What are the action items and follow-ups?" },
-    { label: "Key decisions", icon: "🎯", query: "What were the key decisions made?" },
-    { label: "Summary", icon: "📝", query: "Give me a concise 3-bullet summary" },
-    { label: "Questions asked", icon: "❓", query: "What questions were asked or left open?" }
+    { label: "Action items", query: "What are the action items and follow-ups?" },
+    { label: "Key decisions", query: "What were the key decisions made?" },
+    { label: "Summary", query: "Give me a concise 3-bullet summary" },
+    { label: "Questions asked", query: "What questions were asked or left open?" }
   ];
 
   const chipsContainer = el("div", { class: "prompt-chips", style: "margin-block-end: var(--s-3);" });
@@ -2717,14 +2905,12 @@ function renderAsk(body, rec) {
     chipsContainer.append(el("button", {
       class: "chip",
       type: "button",
+      text: s.label,
       onclick: () => {
         input.value = s.query;
         form.dispatchEvent(new Event("submit", { cancelable: true }));
       }
-    }, [
-      el("span", { class: "chip-icon", text: s.icon }),
-      el("span", { text: s.label })
-    ]));
+    }));
   });
 
   const form = el("form", { class: "ask-form" }, [input, go]);
@@ -2768,10 +2954,63 @@ function renderLive(payload) {
   }
   if (state.selectedId !== LIVE_ID || !state.detail) return;
 
-  state.detail.blocks = payload.blocks;
+  // A3/A15: the server sends block deltas, not the whole transcript. A `full`
+  // snapshot (the first event after connect or an SSE reconnect, or a new
+  // recording) replaces everything; a delta keeps [0..replaceFrom) and swaps in
+  // the changed suffix. The per-subscriber baseline on the server guarantees a
+  // full snapshot always precedes any delta, so this never splices a suffix onto
+  // a transcript it never received.
+  const prev = state.detail.blocks || [];
+  const from = payload.full ? 0 : (payload.replaceFrom ?? 0);
+  state.detail.blocks = prev.slice(0, from).concat(payload.blocks || []);
   state.liveVolatile = payload.volatile || "";
   state.liveError = payload.error || null;
-  if (state.view === "transcript") renderReader();
+
+  if (state.view !== "transcript") return;
+
+  // Update only the changed turns and the volatile tail rather than rebuilding
+  // every turn and listener several times a second. Fall back to a full render
+  // for a full snapshot, or when the spine isn't present (the empty-state
+  // placeholder is showing, or first paint).
+  const spine = $("#spine");
+  if (!payload.full && spine && applyLiveDelta(spine, from)) return;
+  renderReader();
+}
+
+/**
+ * Splice the live transcript's DOM to match `state.detail.blocks` from index
+ * `from` onward, plus the volatile tail. Returns false — asking the caller to do
+ * a full render — if the DOM and the model don't line up.
+ */
+function applyLiveDelta(spine, from) {
+  const blocks = state.detail.blocks;
+  // The spine holds one `.turn` per block followed by a single volatile turn
+  // (the words still being heard). Everything but that trailing turn is a block.
+  const volatileTurn = $("#volatile")?.closest(".turn") || null;
+  const turns = Array.from(spine.children).filter((child) => child !== volatileTurn);
+  // If our model expects more existing turns than the DOM has, it's out of step —
+  // rebuild from scratch rather than guess.
+  if (from > turns.length) return false;
+
+  for (let i = turns.length - 1; i >= from; i--) turns[i].remove();
+
+  let prevSpeaker = from > 0 ? blocks[from - 1].speaker : null;
+  for (let i = from; i < blocks.length; i++) {
+    const turn = buildTurn(state.detail, blocks[i], prevSpeaker, {});
+    if (volatileTurn) spine.insertBefore(turn, volatileTurn);
+    else spine.append(turn);
+    prevSpeaker = blocks[i].speaker;
+  }
+
+  const vol = $("#volatile");
+  if (vol) vol.textContent = state.liveVolatile;
+
+  markCurrentTurn();
+  if (liveFollowing) {
+    const body = $("#readerBody");
+    if (body) body.scrollTop = body.scrollHeight;
+  }
+  return true;
 }
 
 /* ── Boot ─────────────────────────────────────────────────── */
@@ -3011,6 +3250,48 @@ function settingsConfirm({ title, body, target, confirmLabel, danger = false }) 
     );
     // Esc closes without firing either button, and `answer` stays false.
     dialog.addEventListener("close", () => { dialog.remove(); resolve(answer); });
+    document.body.append(dialog);
+    dialog.showModal();
+  });
+}
+
+/**
+ * A modal text-entry dialog — the non-blocking `<dialog>` counterpart to the
+ * browser's `prompt()`. Resolves to the trimmed string, or null if cancelled,
+ * dismissed with Esc, or `<dialog>` is unsupported. Shares `.set-dialog` styling
+ * with `settingsConfirm`, so the reader's rename flow matches Settings.
+ */
+function settingsPrompt({ title, body, value = "", placeholder = "", confirmLabel = "Save" }) {
+  return new Promise((resolve) => {
+    const titleId = `setDialogTitle-${++settingsDialogSeq}`;
+    const dialog = el("dialog", { class: "set-dialog", "aria-labelledby": titleId });
+    if (typeof dialog.showModal !== "function") { resolve(null); return; }
+
+    const field = el("input", {
+      class: "field", type: "text", value, placeholder,
+      "aria-label": title, autofocus: true, style: "inline-size:100%;box-sizing:border-box",
+    });
+    const cancel = el("button", { class: "btn", type: "button", text: "Cancel" });
+    const confirm = el("button", { class: "btn primary", type: "button", text: confirmLabel });
+    let answer = null;
+    cancel.addEventListener("click", () => dialog.close());
+    confirm.addEventListener("click", () => { answer = field.value; dialog.close(); });
+    // Enter commits, like a native prompt.
+    field.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") { event.preventDefault(); answer = field.value; dialog.close(); }
+    });
+
+    dialog.append(
+      el("h2", { id: titleId, text: title }),
+      body ? el("p", { text: body }) : null,
+      field,
+      el("div", { class: "set-dialog-actions" }, [cancel, confirm]),
+    );
+    // Esc closes without committing, and `answer` stays null.
+    dialog.addEventListener("close", () => {
+      dialog.remove();
+      resolve(answer === null ? null : answer.trim());
+    });
     document.body.append(dialog);
     dialog.showModal();
   });
@@ -3640,7 +3921,9 @@ function renderSettings() {
 
   const wrap = el("div", { class: "set-wrap frame indent" }, [
     el("div", { class: "set-head" }, [
-      el("h2", { text: "Settings" }),
+      // h1, not h2 (B7): this is the Settings pane's top heading, so the heading
+      // hierarchy matches the other panes (reader, Ask, Docs each expose one h1).
+      el("h1", { text: "Settings" }),
       settingsStatusNode,
     ]),
   ]);

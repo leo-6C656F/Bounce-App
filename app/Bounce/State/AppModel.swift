@@ -397,7 +397,19 @@ final class AppModel {
     func rename(_ recording: Recording, to title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         RecordingStore.shared.update(id: recording.id) {
-            $0.title = trimmed.isEmpty ? Recording.untitled : trimmed
+            if trimmed.isEmpty {
+                // Clearing the title hands it back to the app — an empty title is
+                // "untitled", which `AutoOrganizer` and a link are free to fill.
+                $0.title = Recording.untitled
+                $0.titleSource = nil
+            } else {
+                $0.title = trimmed
+                // The user typed this by hand, so nothing automatic overwrites it —
+                // not a re-transcribe, and not a manual meeting link. The Meeting
+                // card's "Use meeting name" is the one-tap escape when they do want
+                // the meeting's name.
+                $0.titleSource = .user
+            }
         }
         syncManager.refreshLibrary()
     }
@@ -450,11 +462,17 @@ final class AppModel {
                 rec.seriesId = seriesId
                 rec.seriesRecap = nil
             }
-            // Name it after the meeting only when the user hasn't titled it —
-            // the same rule the automatic path follows.
-            if !eventTitle.isEmpty,
-               RecordingTitleSelection.isUntitled(rec.title, placeholder: Recording.untitled) {
+            // Adopt the meeting's name on this manual link — unless the user typed
+            // the current title themselves. This is the user *asking* to link, so
+            // an app-chosen title (`.auto`) or an untitled recording takes the
+            // meeting's name; only a hand-typed title (`.user`) is preserved. A
+            // legacy `nil` source is treated as the user's, so an old AI title is
+            // kept rather than silently overwritten — the Meeting card's "Use
+            // meeting name" gives one-tap adoption when that's what they want.
+            let isUntitled = RecordingTitleSelection.isUntitled(rec.title, placeholder: Recording.untitled)
+            if !eventTitle.isEmpty, isUntitled || rec.titleSource == .auto {
                 rec.title = RecordingTitleSelection.numbered(eventTitle, existingTitles: existingTitles)
+                rec.titleSource = .auto
             }
             if DeliverySettings.shared.geotagRecordings, let place = event.place,
                rec.place?.shouldBeReplaced(by: place) ?? true {
@@ -475,6 +493,28 @@ final class AppModel {
             rec.calendarLinkConfirmed = true
             rec.calendarEventTitle = nil
             rec.calendarAttendees = nil
+        }
+        syncManager.refreshLibrary()
+    }
+
+    /// Rename a recording to its linked meeting's name on demand.
+    ///
+    /// The explicit escape hatch behind `linkCalendarEvent`'s title rule: linking
+    /// won't overwrite a title the user typed, so this gives them a one-tap way to
+    /// take the meeting's name anyway — from the Meeting card — without having to
+    /// clear their title first. A no-op when there's no linked meeting to borrow a
+    /// name from. Sets the source back to `.auto`, since the title is once again the
+    /// app's (the meeting's), which keeps it adoptable by a later re-link.
+    func adoptMeetingTitle(for recording: Recording) {
+        guard let eventTitle = recording.calendarEventTitle?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !eventTitle.isEmpty
+        else { return }
+        let existingTitles = RecordingStore.shared.recordings
+            .filter { $0.id != recording.id }
+            .map(\.title)
+        RecordingStore.shared.update(id: recording.id) { rec in
+            rec.title = RecordingTitleSelection.numbered(eventTitle, existingTitles: existingTitles)
+            rec.titleSource = .auto
         }
         syncManager.refreshLibrary()
     }
@@ -542,28 +582,34 @@ final class AppModel {
     ///
     /// Idempotent — a repeated call with nothing changed does nothing — which is
     /// what makes it safe to run on every foreground.
-    func syncReminders() async {
+    /// Returns the outcome so the explicit-send path can surface it. The
+    /// Bounce-side edits (link/complete/unlink) are still applied here; only the
+    /// *reporting* is left to the caller, and only `pushActionItems` reports —
+    /// the foreground pass discards the return and stays silent.
+    @discardableResult
+    func syncReminders() async -> ReminderSyncOutcome {
         let outcome = await RemindersSync.shared.sync(items: allActionItems.map(\.item))
-        guard !outcome.linked.isEmpty || !outcome.completed.isEmpty || !outcome.unlinked.isEmpty
-        else { return }
+        guard !outcome.isEmpty else { return outcome }
 
         let completed = Set(outcome.completed)
         let unlinked = Set(outcome.unlinked)
-        for recording in recordings where recording.actionItems?.isEmpty == false {
-            RecordingStore.shared.update(id: recording.id) { rec in
-                guard var items = rec.actionItems else { return }
-                for index in items.indices {
-                    let id = items[index].id
-                    if let reminderId = outcome.linked[id] { items[index].reminderId = reminderId }
-                    if completed.contains(id) { items[index].isDone = true }
-                    // Dropped rather than recreated: recreating fights a user who
-                    // deleted the reminder on purpose.
-                    if unlinked.contains(id) { items[index].reminderId = nil }
-                }
-                rec.actionItems = items
+        // One pass over the whole library, saved once — not N whole-library
+        // serializations. The closure guards itself, the way the old
+        // `for recording in recordings where …` loop did.
+        RecordingStore.shared.batchUpdate { rec in
+            guard var items = rec.actionItems, !items.isEmpty else { return }
+            for index in items.indices {
+                let id = items[index].id
+                if let reminderId = outcome.linked[id] { items[index].reminderId = reminderId }
+                if completed.contains(id) { items[index].isDone = true }
+                // Dropped rather than recreated: recreating fights a user who
+                // deleted the reminder on purpose.
+                if unlinked.contains(id) { items[index].reminderId = nil }
             }
+            rec.actionItems = items
         }
         syncManager.refreshLibrary()
+        return outcome
     }
 
     /// POST each new task to the task webhook, once.
@@ -611,18 +657,17 @@ final class AppModel {
         guard !outcome.linked.isEmpty || !outcome.unlinked.isEmpty else { return }
 
         let unlinked = Set(outcome.unlinked)
-        for recording in recordings where recording.actionItems?.isEmpty == false {
-            RecordingStore.shared.update(id: recording.id) { rec in
-                guard var items = rec.actionItems else { return }
-                for index in items.indices {
-                    let id = items[index].id
-                    if let eventId = outcome.linked[id] { items[index].calendarEventId = eventId }
-                    // Dropped rather than recreated — an event the user deleted in
-                    // Calendar should stay deleted.
-                    if unlinked.contains(id) { items[index].calendarEventId = nil }
-                }
-                rec.actionItems = items
+        // One pass, saved once — see `syncReminders`.
+        RecordingStore.shared.batchUpdate { rec in
+            guard var items = rec.actionItems, !items.isEmpty else { return }
+            for index in items.indices {
+                let id = items[index].id
+                if let eventId = outcome.linked[id] { items[index].calendarEventId = eventId }
+                // Dropped rather than recreated — an event the user deleted in
+                // Calendar should stay deleted.
+                if unlinked.contains(id) { items[index].calendarEventId = nil }
             }
+            rec.actionItems = items
         }
         syncManager.refreshLibrary()
     }
@@ -723,20 +768,63 @@ final class AppModel {
             rec.actionItems = list
         }
         syncManager.refreshLibrary()
-        await deliverPushedTasks()
+        let reminders = await deliverPushedTasks()
+
+        // Keep the "Sent" badge honest. When Reminders was the only destination and
+        // a creation couldn't be written (a deleted list, a failed commit), un-push
+        // the affected items so they don't show "Sent" for a reminder that never
+        // landed — and so the user can send them again once they fix the list. With
+        // another destination also enabled the shared `pushRequested` flag is left
+        // set (the push may have reached Calendar or the webhook); see
+        // `ReminderSendReport.idsToUnsend`.
+        let remindersOnly = RemindersSync.shared.syncEnabled
+            && !TaskCalendarWriter.shared.writeEnabled
+            && !TaskDestinations.shared.webhookEnabled
+        let toUnsend = Set(ReminderSendReport.idsToUnsend(
+            failedToCreate: reminders.failedToCreate,
+            remindersIsOnlyDestination: remindersOnly))
+        if !toUnsend.isEmpty {
+            for r in recordings where r.actionItems?.isEmpty == false {
+                RecordingStore.shared.update(id: r.id) { rec in
+                    guard var list = rec.actionItems else { return }
+                    for index in list.indices where toUnsend.contains(list[index].id) {
+                        list[index].pushRequested = false
+                    }
+                    rec.actionItems = list
+                }
+            }
+            syncManager.refreshLibrary()
+        }
+
+        // Surface the result of the explicit send. Only Reminders is reported —
+        // it is the destination the user tapped Send expecting to land in, and the
+        // one that used to fail silently. Nil (nothing added, nothing failed) shows
+        // nothing.
+        taskSendResult = ReminderSendReport.message(
+            added: reminders.linked.count,
+            failed: reminders.failedToCreate.count)
     }
 
-    /// Run every enabled task-destination reconciliation pass.
+    /// The result of the most recent explicit Send, for the Tasks screen to show
+    /// and then clear. Nil when there is nothing to report. Set **only** by
+    /// `pushActionItems`, never by the silent foreground pass.
+    var taskSendResult: ReminderSendReport.Message?
+
+    /// Run every enabled task-destination reconciliation pass, returning the
+    /// Reminders outcome so the explicit-send path can report it.
     ///
     /// Shared by `pushActionItems` and `handleForeground`. Each pass is a no-op
     /// when its destination is off or has nothing to do, and none of them create
     /// anything for a task the user hasn't pushed — so running this on every
     /// foreground reconciles completion and dates for already-pushed tasks without
-    /// ever mirroring a candidate behind the user's back.
-    func deliverPushedTasks() async {
-        await syncReminders()
+    /// ever mirroring a candidate behind the user's back. `handleForeground`
+    /// discards the return; only the explicit send surfaces it.
+    @discardableResult
+    func deliverPushedTasks() async -> ReminderSyncOutcome {
+        let reminders = await syncReminders()
         await syncTaskCalendar()
         await sendTaskWebhooks()
+        return reminders
     }
 
     /// Add or remove a tag on one recording.

@@ -200,7 +200,12 @@ cookie automatically, which is exactly what Gate 2 is for. Both gates already
 pass non-browser clients correctly: `HTTPRequest.isCrossSite` treats "no
 `Sec-Fetch-Site` **and** no `Origin`" as same-site so `curl` and MCP clients
 work, and `WebSession.isAllowedHost` accepts any private IPv4 because that is the
-phone on some interface. So no change was needed to let agents in, which is the
+phone on some interface. When `Sec-Fetch-Site` is absent but an `Origin` is
+present (older Safari), the fallback parses the `Origin` and compares its **host
+for equality** with the request's Host header — never a substring match. A
+`.contains` check read `http://192.168.1.42.attacker.com` as same-site because its
+host *contains* the phone's address; the equality comparison closes that. There's
+a `tools/web-security-tests` harness pinning it. So no change was needed to let agents in, which is the
 outcome you want — widening a security gate to admit a new client is how these
 things go wrong.
 
@@ -261,6 +266,60 @@ Three implementation facts worth knowing:
   certificate — and an IP has to be encoded as an `iPAddress` general name, not
   a `dNSName`.
 
+### Desktop view: scaling to a large library and a long recording
+
+Every `WebAPI` handler runs on the phone's main actor (`RecordingStore` has no
+lock), so the desktop view's cost lands on the same thread that drives SwiftUI.
+The design keeps that cost bounded on both ends of the wire.
+
+- **The library and search are paginated.** `GET /api/library` and `GET
+  /api/search` return a `{items, total, offset, limit}` envelope and map only the
+  requested window to rows, so no single response serializes the whole library on
+  the main actor. The desktop client walks the pages and accumulates them, so its
+  day grouping, filters and search still see the full set. Default page 200,
+  max 500.
+- **Search is indexed, not re-scanned.** `Web/SearchIndex.swift` caches a
+  lowercased "title + transcript" haystack per recording, rebuilt only when a
+  coarse per-recording signature (title, segment count, summary/speaker state)
+  moves — the same change-signal model `LiveChannel`'s library fingerprint uses.
+  A search is then a `contains` over pre-lowercased strings rather than a fresh
+  `.lowercased()` of every transcript per request, capped at 1000 matches. The
+  tradeoff: an in-place word correction that changes neither segment count nor
+  title is reflected in desktop *search* only after the next library change (the
+  phone's own search is always current); the cache is in-memory and clears on
+  relaunch.
+- **The live channel sends deltas.** `LiveChannel` polls at 4 Hz but sends only
+  the changed block suffix (`replaceFrom` + the tail) plus the volatile text,
+  rather than re-encoding the whole transcript every tick — which was quadratic
+  over a long meeting. Each subscriber carries a `sentLiveBaseline` flag: its
+  first live event (a fresh connect, an `EventSource` reconnect, or a new
+  recording) is a full snapshot, and only then deltas, so a late joiner never
+  splices a suffix onto a transcript it never had. The whole-library fingerprint
+  that drives the `library` refetch signal is checked at ~1 Hz, not 4 Hz, since
+  hashing every recording is the expensive part and the library moves slowly.
+- **SSE writes have backpressure.** `HTTPConnection.sendEvent` keeps at most one
+  frame in flight per socket and *drops* (coalesces) the next one while a send is
+  outstanding — every live/status frame is an idempotent snapshot, so the next
+  tick carries the freshest state. Without it a slow client queues frames inside
+  `NWConnection` unboundedly and the phone's memory climbs until keepalive kills
+  the peer.
+
+### Desktop view: server lifecycle
+
+`DesktopServer` is a foreground session (iOS suspends a backgrounded app and the
+socket dies with it), extended by audio residency or an active recording. Two
+lifecycle hazards are handled explicitly:
+
+- **Restart on foreground.** When nothing can hold the process up, backgrounding
+  stops the server but sets `suspendedForBackground`, and returning to the
+  foreground restarts it. Previously a brief app-switch stopped the server for
+  good, leaving every browser retrying a dead URL — the foreground handler
+  early-returned because the server was no longer running.
+- **A cancelable start.** `start()` stamps a monotonic `startToken`; `bringUp`
+  re-checks it after the seconds-long, off-actor RSA keygen, and `stop()` advances
+  it. So enabling then disabling the feature while the keypair is still generating
+  no longer brings a listener up that was already told to stop.
+
 ## Device layer
 
 ### One delegate, fanned out
@@ -274,7 +333,7 @@ To handle a new SDK callback, implement it in the `PlaudDeviceAgentProtocol` ext
 
 `PlaudWiFiAgent` has its own separate delegate slot, which `SyncManager` claims directly.
 
-**Callbacks that bypass `DeviceManager` must hop to main themselves.** SDK callbacks arrive on SDK-internal queues; `DeviceManager` wraps every one of its forwards in `DispatchQueue.main.async`, which is why `SyncManager`'s `handle*` methods can safely touch the lock-free `RecordingStore` and publish to SwiftUI. Two callback families do **not** pass through that hop: the `AudioExportCallback` object handed to `exportAudio(callback:)` (the BLE download path — `SyncManager` conforms to it directly), and the `PlaudWiFiAgentProtocol` delegate (`wifiHandshake` / `wifiFileList` / …). Both land on an SDK queue and each body hops to main itself — matching the rest of the device layer's main-confinement. Getting this wrong is an off-main mutation of a shared `Array` (heap corruption, or a "Publishing changes from background threads" crash), not a warning; the sibling `WiFiExportHandler` is the pattern to copy.
+**Callbacks that bypass `DeviceManager` must hop to main themselves.** SDK callbacks arrive on SDK-internal queues; `DeviceManager` wraps every one of its forwards in `DispatchQueue.main.async`, which is why `SyncManager`'s `handle*` methods can safely publish to SwiftUI. Two callback families do **not** pass through that hop: the `AudioExportCallback` object handed to `exportAudio(callback:)` (the BLE download path — `SyncManager` conforms to it directly), and the `PlaudWiFiAgentProtocol` delegate (`wifiHandshake` / `wifiFileList` / …). Both land on an SDK queue and each body hops to main itself — matching the rest of the device layer's main-confinement. Getting this wrong is an off-main mutation of a shared `Array` in SwiftUI-published state (a "Publishing changes from background threads" crash), not a warning; the sibling `WiFiExportHandler` is the pattern to copy. Note that `RecordingStore` itself is now internally lock-guarded (see [The in-memory library](#the-in-memory-library-indexed-isolated-off-main)), so touching *it* off-main is safe on its own — the main hop remains for the SwiftUI publishing that rides alongside, and as belt-and-suspenders.
 
 ### Discovering devices the SDK can't see
 
@@ -416,6 +475,16 @@ Everything is exported as **MP3**, in both the BLE and WiFi paths. Two hard cons
 The SDK also offers Opus, which is meaningfully smaller — but it lands in an Ogg container that `AVAudioFile` cannot open, which would break transcription outright. So Opus is deliberately unused despite being available. This is a change from the reference template, which used Opus on the WiFi path.
 
 Concretely the recorder produces **MPEG-2 (LSF) Layer III, 16 kHz mono**, LAME-encoded with an `Info`/`Xing` metadata frame at the head. 16 kHz exists only in the MPEG-2 sampling-rate table, so frames are 576 samples (36 ms), not the 1152 that most MP3 references quote.
+
+## The in-memory library: indexed, isolated, off-main
+
+`RecordingStore` is the single source of truth for recording metadata, and for most of the app's life it was a synchronous, main-actor, whole-library JSON blob with no internal synchronisation: a plain `[Recording]` cache re-sorted on every read, scanned linearly on every lookup, and re-encoded + rewritten to disk **synchronously, once per single-field mutation**. That is fine at 30 recordings and stutters at 3,000, and its lack of isolation is what let an off-main SDK callback race a main-actor read of the same `Array`. It was refactored into an indexed, lock-guarded, off-main store:
+
+- **Indexed core (`Storage/RecordingIndex.swift`).** A pure `struct` holding `[id: Recording]` and `[sessionId: Recording]` maps plus a lazily-materialised newest-first sorted array. `recording(id:)` / `recording(sessionId:)` are O(1) dictionary hits and `recordings` no longer re-sorts on each access — it reuses the cached array until a structural change (insert / remove / replaceAll) invalidates it. `id`, `sessionId` and `createdAt` are all `let`, so an in-place `update` can never change a key or the sort order; it patches the cached element rather than forcing a re-sort. The index is pure Foundation over `Recording`, so `tools/recordingstore-tests` exercises the real invariants standalone (the store itself drags in `Soniox`, `WaveformCache` and disk I/O and can't compile outside the app).
+- **Isolation via one `Mutex`.** The index (and the save bookkeeping) live in a single `State` value guarded by a Swift `Mutex` (Synchronization framework); every access goes through a scoped `withLock {}`, which is harder to misuse than a raw lock/unlock. Every public accessor is still **synchronous** — the ~120 call sites were left untouched, which is why this refactor didn't fan out across the app — but each one takes the mutex around the index. The store is therefore safe to read and write from any thread, which root-fixes the former shared-`Array` data race: correctness no longer depends on every call site being on the right thread. The mutex is non-recursive, so a `mutate` / `batchUpdate` closure must not call back into a public store method (all existing closures only touch their `inout Recording`), and it is never held across the disk write — the save path snapshots the library under the lock and encodes + writes it on `ioQueue`.
+- **A one-time backup guards the rollout.** The first launch on this build copies the existing `library.json` aside to `library.backup-<ts>.json` (off-main, gated by a `UserDefaults` marker) before the new save path can write, so a bug in the rewrite can't lose real recordings.
+- **Off-main, coalesced saves.** Encoding + the atomic write run on a serial `ioQueue`, from a snapshot taken under the lock (the lock is never held across the write). `update` schedules a **debounced** (~150 ms cancel-and-reschedule) save, so a loop of single-field mutations — the Reminders/Calendar reconciliation in `AppModel`, the tag- and series-sweeps — collapses to one whole-library serialization instead of N. `batchUpdate` mutates every row and saves once for the same reason; the two `AppModel` sync loops now call it rather than looping `update`. Structural / user-visible durable events (`add`, `replaceAll`, `delete`, `markSynced`, `batchUpdate`) save **immediately** (still off-main), and `flush()` does a **synchronous** write at scene → background / inactive so a mutation made in the last debounce window is durable before the OS can suspend the app.
+- **Write failures are surfaced, not swallowed.** The encode and write legs use real `do`/`catch` (the write leg retries once) and record the failure in `lastSaveError` with a `[Store]` log, instead of the old `try?` that let the in-memory library silently diverge from disk on a disk-full or locked-file write. The corrupt-vs-missing quarantine below is unchanged.
 
 ## Stored-model compatibility
 
@@ -630,7 +699,9 @@ Note that the recorder's own **pause** already produces one file with one `sessi
 
 ### The audio is concatenated frame-by-frame, like every other edit
 
-`MP3Frames.merge` is the same copy `write` does, run across several files. Layer III frames are self-delimiting and carry no file-level state, so an MP3 is a bare sequence of frames and appending one file's to another's produces a valid stream — nothing is decoded, nothing re-encoded, and the output is still MP3, which the whole app depends on. `write` and `merge` share `selectFrames`/`appendFrames` so an edit and a join can't drift into two different notions of "kept".
+`MP3Frames.merge` is the same copy `write` does, run across several files. Layer III frames are self-delimiting and carry no file-level state, so an MP3 is a bare sequence of frames and appending one file's to another's produces a valid stream — nothing is decoded, nothing re-encoded, and the output is still MP3, which the whole app depends on. `write` and `merge` share `selectFrames` and one `streamWrite` so an edit and a join can't drift into two different notions of "kept".
+
+Both **stream the output to disk through a bounded buffer** rather than building it in a resident `Data` and writing once. A many-part join of long recordings could otherwise assemble a several-hundred-megabyte buffer and be killed by jetsam mid-merge. Sources are memory-mapped and copied a few megabytes at a time to a `FileHandle`; when the result is variable-bitrate, the leading Xing frame is reserved up front and patched from the true frame/byte totals once the frames are on disk. The write lands in a sibling temp file moved atomically into place, so a crash mid-write can't leave a half-written file where the destination is.
 
 - **Version, sample rate and channel count must match across sources; bitrate need not.** A decoder handles a bitrate change mid-stream — that is all VBR is, and a mixed-bitrate result gets a synthesized Xing header — but a sample-rate or mono/stereo change would play the rest of the file at the wrong speed or drop a channel. Mismatches throw `Failure.formatMismatch` rather than being written. Every file from one Plaud is 16 kHz mono MPEG-2, so in practice this only fires on a hand-imported file. This mirrors what `MP3Frames.index` already enforces within a single file, and for the same reason.
 - Expect the usual ~72 ms of imperfect audio at each join (bit reservoir), exactly as at any cut.
@@ -737,6 +808,19 @@ used to live inside `AskView`. It was extracted rather than reimplemented
 because two clients matching independently would answer the same question
 differently — the same class of quiet divergence the single timecode formatter
 exists to prevent.
+
+Both `AskCorpus` and the Library's search read a per-recording **lowercased
+transcript haystack cached by `RecordingSearchIndex`**, rather than re-joining
+and re-lowercasing every transcript. `Transcript.plainText` is a computed
+re-join and `.lowercased()` allocates a second full copy of the whole
+transcript, so doing it on every keystroke (Library) or every question (Ask),
+across the whole library, scaled with library size and blocked the main thread.
+The index builds each haystack once and reuses it until that recording's
+transcript changes (keyed by `Recording.searchIdentity`); it is lock-guarded
+rather than an actor so the pure, off-main `AskCorpus` and the web/MCP callers
+can read it synchronously. `LibraryView` debounces the search field and runs the
+filter off the main actor into `@State`; `AskView` assembles its grounding off
+the main actor too.
 
 ### The client is laid out as a published interview
 

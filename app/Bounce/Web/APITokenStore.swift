@@ -33,15 +33,47 @@ enum APITokenStore {
 
     private static let key = "web_api_token"
 
+    /// In-memory copy of the token, so a bearer request doesn't hit the keychain
+    /// on every call.
+    ///
+    /// The read used to go to the keychain per request, which made revocation
+    /// instant at the cost of serializing a synchronous `SecItemCopyMatching` on
+    /// the main actor under any request storm (a single detail view fans out to
+    /// `/detail` + `/audio` + `/waveform`; an agent hits it every call). This
+    /// caches instead, and stays correct because **this app is the only writer of
+    /// this keychain item** — every mutation goes through `save`/`clear` below,
+    /// which invalidate the cache, so revocation is still immediate and total.
+    /// `.loaded == false` means "not yet read"; a loaded `nil` means "read, and
+    /// there is no token" (also how a locked device reads — correctly denied).
+    private static let cacheLock = NSLock()
+    private static var cache: (loaded: Bool, value: String?) = (false, nil)
+
     /// The stored token, or nil if none has been generated (or the device is
     /// locked, which reads the same as absent — and correctly denies the
     /// request either way).
     static var token: String? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        if cache.loaded { return cache.value }
+        let value = loadFromKeychain()
+        cache = (true, value)
+        return value
+    }
+
+    private static func loadFromKeychain() -> String? {
         guard let data = KeychainStore.loadData(for: key),
               let value = String(data: data, encoding: .utf8),
               !value.isEmpty
         else { return nil }
         return value
+    }
+
+    /// Drop the in-memory copy so the next read re-consults the keychain. Called
+    /// from every path that changes the stored token.
+    private static func invalidateCache() {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        cache = (false, nil)
     }
 
     static var hasToken: Bool { token != nil }
@@ -63,10 +95,15 @@ enum APITokenStore {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { clear(); return }
         try KeychainStore.saveData(Data(trimmed.utf8), for: key)
+        invalidateCache()
     }
 
-    /// Revoke. Takes effect on the next request — there is no cached copy.
-    static func clear() { KeychainStore.delete(key) }
+    /// Revoke. Takes effect on the next request — the in-memory copy is dropped
+    /// here, so `matches` re-reads the (now empty) keychain immediately.
+    static func clear() {
+        KeychainStore.delete(key)
+        invalidateCache()
+    }
 
     /// Revoke, handing back the token that was in force.
     ///
@@ -91,9 +128,9 @@ enum APITokenStore {
     /// The auth check. Constant-time, and false when no token has been
     /// generated so revoking is immediate and total.
     ///
-    /// Reads the keychain per call rather than caching, which is what makes
-    /// revocation instant; at LAN request volumes the read is not worth a cache
-    /// that would need invalidating.
+    /// Reads through the in-memory cache (see `token`), which every mutation
+    /// invalidates — so revocation is still instant while a request storm no
+    /// longer serializes a keychain read on the main actor per call.
     static func matches(_ candidate: String?) -> Bool {
         guard let candidate, let stored = token else { return false }
         return APITokenFormat.matches(candidate, stored)

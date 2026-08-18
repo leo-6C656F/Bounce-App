@@ -27,14 +27,27 @@ final class LiveChannel {
     private static let tickInterval = Duration.milliseconds(250)
     /// Prunes sockets the OS hasn't told us about yet.
     private static let heartbeatInterval: TimeInterval = 15
+    /// The library hash is the expensive per-tick job — ~8 fields of every
+    /// recording — and the library changes far slower than the transcript. Recheck
+    /// it at ~1 Hz rather than 4 Hz (A14). The event it drives is only a
+    /// refetch signal, so a fraction of a second of latency costs nothing.
+    private static let libraryHashInterval: TimeInterval = 1.0
 
     /// A sink plus the token that opened it. The token is what makes revocation
     /// work: authorization is checked when the stream opens and never again, so
     /// without it a revoked browser keeps receiving live transcripts until the
     /// server stops entirely.
+    ///
+    /// `sentLiveBaseline` is the guard behind A15's delta stream: the transcript
+    /// is sent as incremental block deltas, so a subscriber's **first** live event
+    /// after connecting (or after an `EventSource` auto-reconnect — a brand new
+    /// subscriber either way) must be a complete snapshot, or it would be applying
+    /// a suffix delta against a transcript it never received and desync. It starts
+    /// false and is set true once this sink has been handed a full snapshot.
     private struct Subscriber {
         let sink: any EventStreamSink
         let token: String
+        var sentLiveBaseline = false
     }
 
     private var subscribers: [Subscriber] = []
@@ -44,6 +57,13 @@ final class LiveChannel {
     private var lastStatusFingerprint = ""
     private var lastLibraryFingerprint = ""
     private var lastHeartbeat = Date.distantPast
+    private var lastLibraryHashAt = Date.distantPast
+
+    /// The block list as of the last live push, and the session it belonged to,
+    /// so each tick can send only the changed suffix. A new session (or none)
+    /// resets both and forces a fresh baseline to every subscriber.
+    private var lastLiveBlocks: [WebBlock] = []
+    private var lastLiveSessionId: Int?
 
     // MARK: - Clients
 
@@ -82,6 +102,10 @@ final class LiveChannel {
         lastLiveFingerprint = ""
         lastStatusFingerprint = ""
         lastLibraryFingerprint = ""
+        // Force the throttled library check to fire on the very next tick, so a
+        // newly connected browser gets the refetch signal promptly rather than
+        // waiting up to a full `libraryHashInterval`.
+        lastLibraryHashAt = .distantPast
     }
 
     // MARK: - Pump
@@ -109,14 +133,18 @@ final class LiveChannel {
         removeClosed()
         guard !subscribers.isEmpty else { return }
 
-        // Fingerprint first, build only on a change. Building the live payload
-        // means regrouping the whole transcript into blocks and JSON-encoding
-        // it, on the main actor, and at 4 Hz during a long recording that is a
-        // real cost to pay for something usually thrown away.
-        push(fingerprint: liveFingerprint(), against: &lastLiveFingerprint, build: livePayload)
+        // Live is handled per-subscriber: incremental deltas to established
+        // clients, a full snapshot to any that haven't received a baseline yet.
+        pushLive()
+
         push(fingerprint: statusFingerprint(), against: &lastStatusFingerprint, build: statusPayload)
-        push(fingerprint: libraryFingerprint(), against: &lastLibraryFingerprint) {
-            #"{"type":"library"}"#
+
+        // A14: recheck the (expensive, whole-library) fingerprint at ~1 Hz.
+        if Date().timeIntervalSince(lastLibraryHashAt) >= Self.libraryHashInterval {
+            lastLibraryHashAt = Date()
+            push(fingerprint: libraryFingerprint(), against: &lastLibraryFingerprint) {
+                #"{"type":"library"}"#
+            }
         }
 
         if Date().timeIntervalSince(lastHeartbeat) > Self.heartbeatInterval {
@@ -155,24 +183,104 @@ final class LiveChannel {
             + "|\(named.sorted { $0.key < $1.key })"
     }
 
-    private func livePayload() -> String {
+    /// Push the live transcript to each subscriber: a full snapshot to any that
+    /// hasn't been given a baseline yet (a fresh connect, or an `EventSource`
+    /// auto-reconnect — a new subscriber either way), an incremental delta to the
+    /// rest — and only when something actually changed.
+    ///
+    /// This is A15: the old code regrouped the whole transcript and JSON-encoded
+    /// every block up to 4×/sec, a cost that grew with meeting length (quadratic
+    /// over a call). Grouping still happens — it reads all segments — but the
+    /// encode, the network payload and (with the client's matching splice) the DOM
+    /// work are now bounded to the changed suffix, which is normally one block.
+    private func pushLive() {
         let live = LiveTranscriber.shared
-        let names = live.sessionId.map {
-            LiveSpeakerNameStore.shared.names(forSessionId: $0)
-        } ?? [:]
+        let sessionId = live.sessionId
+
+        // A new recording (or the end of one) invalidates every client's block
+        // list, so reset the diff base and force a fresh baseline to everyone —
+        // otherwise a delta would be spliced onto the previous recording.
+        if sessionId != lastLiveSessionId {
+            lastLiveSessionId = sessionId
+            lastLiveBlocks = []
+            for index in subscribers.indices { subscribers[index].sentLiveBaseline = false }
+            lastLiveFingerprint = ""
+        }
+
+        let needsBaseline = subscribers.contains { $0.sink.isOpen && !$0.sentLiveBaseline }
+        let fingerprint = liveFingerprint()
+        let changed = fingerprint != lastLiveFingerprint
+
+        // Idle open socket: nothing changed and everyone has a baseline. Skipping
+        // here is what stops a quiet stream regrouping and encoding four times a
+        // second.
+        guard changed || needsBaseline else { return }
+
+        // Regroup once (grouping reads all segments), then diff against the last
+        // push to find the first changed block.
+        let names = sessionId.map { LiveSpeakerNameStore.shared.names(forSessionId: $0) } ?? [:]
         let blocks = Transcript(
             segments: live.segments,
             localeIdentifier: Locale.current.identifier,
             createdAt: Date()
-        ).blocks(speakerNames: names.isEmpty ? nil : names)
+        ).blocks(speakerNames: names.isEmpty ? nil : names).map(WebBlock.init)
 
-        return encode(LivePayload(
-            type: "live",
-            isRunning: live.isRunning,
-            sessionId: live.sessionId,
-            error: live.errorMessage,
-            volatile: live.volatileText,
-            blocks: blocks.map(WebBlock.init)))
+        let changedFrom = Self.firstChangedBlock(lastLiveBlocks, blocks)
+
+        // Build the full and delta bodies lazily — most ticks send only one kind.
+        var fullBody: String?
+        var deltaBody: String?
+        func fullPayload() -> String {
+            if let fullBody { return fullBody }
+            let body = encode(LivePayload(
+                type: "live", isRunning: live.isRunning, sessionId: sessionId,
+                error: live.errorMessage, volatile: live.volatileText,
+                full: true, replaceFrom: 0, blocks: blocks))
+            fullBody = body
+            return body
+        }
+        func deltaPayload() -> String {
+            if let deltaBody { return deltaBody }
+            let suffix = changedFrom < blocks.count ? Array(blocks[changedFrom...]) : []
+            let body = encode(LivePayload(
+                type: "live", isRunning: live.isRunning, sessionId: sessionId,
+                error: live.errorMessage, volatile: live.volatileText,
+                full: false, replaceFrom: changedFrom, blocks: suffix))
+            deltaBody = body
+            return body
+        }
+
+        for index in subscribers.indices {
+            guard subscribers[index].sink.isOpen else { continue }
+            if !subscribers[index].sentLiveBaseline {
+                subscribers[index].sink.sendEvent(fullPayload())
+                subscribers[index].sentLiveBaseline = true
+            } else if changed {
+                subscribers[index].sink.sendEvent(deltaPayload())
+            }
+        }
+
+        lastLiveFingerprint = fingerprint
+        lastLiveBlocks = blocks
+    }
+
+    /// First index at which two block lists diverge. Earlier blocks are immutable
+    /// once a later block starts, so in steady state this is `new.count - 1` (the
+    /// growing tail) or `new.count` (only the volatile text moved, no block
+    /// changed).
+    private static func firstChangedBlock(_ old: [WebBlock], _ new: [WebBlock]) -> Int {
+        let common = min(old.count, new.count)
+        var index = 0
+        while index < common {
+            if !sameBlock(old[index], new[index]) { return index }
+            index += 1
+        }
+        return index
+    }
+
+    private static func sameBlock(_ a: WebBlock, _ b: WebBlock) -> Bool {
+        a.id == b.id && a.start == b.start && a.speaker == b.speaker
+            && a.phrases.count == b.phrases.count && a.text == b.text
     }
 
     private func statusFingerprint() -> String {
@@ -238,6 +346,14 @@ private struct LivePayload: Encodable {
     let sessionId: Int?
     let error: String?
     let volatile: String
+    /// True for a complete snapshot: `blocks` replace the whole list. A late
+    /// joiner or an `EventSource` reconnect always receives one of these before
+    /// any delta, so it never splices a suffix onto a transcript it never had.
+    let full: Bool
+    /// The index `blocks` replace from. For a full snapshot this is 0; for a
+    /// delta it is the first changed block, so the client keeps `[0..<replaceFrom)`
+    /// and swaps in `blocks` for the rest.
+    let replaceFrom: Int
     let blocks: [WebBlock]
 }
 

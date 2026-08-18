@@ -107,6 +107,15 @@ final class SyncManager: NSObject {
 
     /// Fetch the file list quietly. If new recordings turn up, sync starts.
     func fetchFileList() {
+        // `AppModel.handleConnectionStateChange` calls this on *every* fresh
+        // connection, so a BLE drop-and-reconnect mid-sync would otherwise re-list
+        // while a download is in flight — `handleFileList` resets
+        // `pendingDownloads`/`syncedCount` and kicks a second `downloadNext`,
+        // producing duplicate downloads and corrupted progress (S-18). Skip it
+        // while a sync is active, exactly as `startSync` already does. A genuine
+        // drop surfaces as `.failed` (not active) via `onError`, so recovery isn't
+        // blocked.
+        guard !state.isActive else { return }
         isSilentFetch = true
         PlaudDeviceAgent.shared.getFileList(startSessionId: 0)
     }
@@ -121,6 +130,12 @@ final class SyncManager: NSObject {
     func stopSync() {
         PlaudDeviceAgent.shared.stopDownloadFile()
         pendingDownloads.removeAll()
+        // These accumulate session ids across the process's life and were never
+        // cleared — `retriedDeletes` had no removal path at all, so it survived an
+        // unpair or device switch into an unrelated device's session (S-19). An
+        // explicit stop/reset is the point to drop them.
+        refusedDeletes.removeAll()
+        retriedDeletes.removeAll()
         stateSubject.send(.idle)
     }
 

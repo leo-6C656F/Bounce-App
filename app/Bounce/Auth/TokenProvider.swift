@@ -43,6 +43,9 @@ final class TokenProvider {
 
     private var cachedToken: UserToken?
     private var inFlight: Task<String, Error>?
+    /// The resolved user id for this process. Held in memory so a failed keychain
+    /// write can't hand out a *fresh* id on the next read — see `userId`.
+    private var cachedUserId: String?
 
     private init() {
         let credentials = KeychainStore.load(PlaudCredentials.self, for: Keys.credentials)
@@ -58,9 +61,25 @@ final class TokenProvider {
     /// once and kept, because the recorder's binding is tied to it — changing it
     /// would orphan the paired device.
     var userId: String {
-        if let existing = KeychainStore.load(String.self, for: Keys.userId) { return existing }
+        if let cachedUserId { return cachedUserId }
+        if let existing = KeychainStore.load(String.self, for: Keys.userId) {
+            cachedUserId = existing
+            return existing
+        }
         let generated = "bounce-" + UUID().uuidString.lowercased()
-        try? KeychainStore.save(generated, for: Keys.userId)
+        do {
+            try KeychainStore.save(generated, for: Keys.userId)
+        } catch {
+            // A swallowed write here was a real hazard: the id is the recorder's
+            // binding key, so handing out a *different* id on the next read
+            // orphans the paired device. Don't swallow — cache the value in
+            // memory so it stays stable for the life of the process, and surface
+            // the failure so a persistently unwritable keychain is visible rather
+            // than silently churning the id every launch.
+            AuthLog.log("⚠︎ couldn't persist userId to keychain: "
+                + "\(error.localizedDescription) — holding it in memory for this session")
+        }
+        cachedUserId = generated
         return generated
     }
 

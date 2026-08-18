@@ -86,30 +86,36 @@ final class CalendarMatcher {
     /// The event a recording most likely belongs to, or nil when there's no
     /// access, no overlapping event, or nothing that passes
     /// `CalendarMatching.bestMatch`.
+    ///
+    /// `async` because the underlying `events(matching:)` runs off the main actor —
+    /// see `candidates`.
     func match(
         recordingStart: Date,
         duration: TimeInterval,
         tolerance: TimeInterval = CalendarMatching.defaultTolerance
-    ) -> CandidateEvent? {
+    ) async -> CandidateEvent? {
         CalendarMatching.bestMatch(
             for: recordingStart,
             duration: duration,
-            among: candidates(recordingStart: recordingStart, duration: duration, tolerance: tolerance),
+            among: await candidates(recordingStart: recordingStart, duration: duration, tolerance: tolerance),
             tolerance: tolerance)
     }
 
     /// The best match together with how confident it is, or nil. The confidence
     /// is what lets a caller link automatically only when sure and otherwise
     /// fall back to the manual picker — see `CalendarMatching.MatchConfidence`.
+    ///
+    /// `async` because the underlying `events(matching:)` runs off the main actor —
+    /// see `candidates`.
     func evaluate(
         recordingStart: Date,
         duration: TimeInterval,
         tolerance: TimeInterval = CalendarMatching.defaultTolerance
-    ) -> (event: CandidateEvent, confidence: CalendarMatching.MatchConfidence)? {
+    ) async -> (event: CandidateEvent, confidence: CalendarMatching.MatchConfidence)? {
         CalendarMatching.evaluate(
             for: recordingStart,
             duration: duration,
-            among: candidates(recordingStart: recordingStart, duration: duration, tolerance: tolerance),
+            among: await candidates(recordingStart: recordingStart, duration: duration, tolerance: tolerance),
             tolerance: tolerance)
     }
 
@@ -126,11 +132,17 @@ final class CalendarMatcher {
     /// specific meeting the user is linking to.
     ///
     /// Silent `[]` on no access, exactly like `candidates`.
+    ///
+    /// `async`, and the `events(matching:)` fetch runs off the main actor — Apple
+    /// documents it as potentially expensive, and the picker opens it against a
+    /// ±3-hour, all-calendars window as the sheet animates in. The store is owned
+    /// solely by this read-only type and `CandidateEvent` is `Sendable`, so nothing
+    /// mutable crosses the hop.
     func surroundingEvents(
         recordingStart: Date,
         duration: TimeInterval,
         window: TimeInterval = CalendarMatcher.pickerWindow
-    ) -> [CandidateEvent] {
+    ) async -> [CandidateEvent] {
         guard canReadEvents else { return [] }
         let span = max(0, duration)
         let window = max(0, window)
@@ -138,23 +150,29 @@ final class CalendarMatcher {
         let to = max(
             recordingStart.addingTimeInterval(span + window),
             from.addingTimeInterval(1))
-        let predicate = store.predicateForEvents(withStart: from, end: to, calendars: nil)
-        return store.events(matching: predicate)
-            .compactMap(Self.candidate(from:))
-            .filter {
-                !$0.isAllDay
-                    && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-            .sorted { $0.start < $1.start }
+        let store = self.store
+        return await Task.detached {
+            let predicate = store.predicateForEvents(withStart: from, end: to, calendars: nil)
+            return store.events(matching: predicate)
+                .compactMap(Self.candidate(from:))
+                .filter {
+                    !$0.isAllDay
+                        && !$0.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }
+                .sorted { $0.start < $1.start }
+        }.value
     }
 
     /// Every event near the recording, flattened. Exposed separately so a picker
     /// can offer the near misses rather than only the single best guess.
+    ///
+    /// `async`, with the `events(matching:)` fetch off the main actor for the same
+    /// reason as `surroundingEvents`.
     func candidates(
         recordingStart: Date,
         duration: TimeInterval,
         tolerance: TimeInterval = CalendarMatching.defaultTolerance
-    ) -> [CandidateEvent] {
+    ) async -> [CandidateEvent] {
         guard canReadEvents else { return [] }
         let span = max(0, duration)
         let tolerance = max(0, tolerance)
@@ -167,10 +185,13 @@ final class CalendarMatcher {
         let to = max(
             recordingStart.addingTimeInterval(span + tolerance),
             from.addingTimeInterval(1))
+        let store = self.store
         // `calendars: nil` means every calendar the user has, which is the point:
         // whichever account the meeting lives in, iOS has already synced it.
-        let predicate = store.predicateForEvents(withStart: from, end: to, calendars: nil)
-        return store.events(matching: predicate).compactMap(Self.candidate(from:))
+        return await Task.detached {
+            let predicate = store.predicateForEvents(withStart: from, end: to, calendars: nil)
+            return store.events(matching: predicate).compactMap(Self.candidate(from:))
+        }.value
     }
 
     // MARK: - Mapping
@@ -181,7 +202,7 @@ final class CalendarMatcher {
     /// `endDate` are `null_unspecified` in the header, so Swift imports them as
     /// implicitly-unwrapped optionals that will happily crash on a detached or
     /// half-formed event rather than being nil-checked for you.
-    private static func candidate(from event: EKEvent) -> CandidateEvent? {
+    nonisolated private static func candidate(from event: EKEvent) -> CandidateEvent? {
         guard let start: Date = event.startDate, let end: Date = event.endDate else { return nil }
         // `structuredLocation` is what a picked place populates and is the only
         // route to coordinates; `location` is the free-text field and is all
@@ -214,7 +235,7 @@ final class CalendarMatcher {
     /// anyone else's. Names come from the calendar server, so one may be an email
     /// address when no display name is published — still a better suggestion than
     /// "Speaker 2", and the user picks from these rather than having them applied.
-    private static func attendeeNames(of event: EKEvent) -> [String] {
+    nonisolated private static func attendeeNames(of event: EKEvent) -> [String] {
         var seen = Set<String>()
         return (event.attendees ?? []).compactMap { participant in
             guard let name = participant.name?.trimmingCharacters(in: .whitespacesAndNewlines),

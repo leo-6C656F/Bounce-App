@@ -78,7 +78,7 @@ final class AutoOrganizer {
         // timestamp is the *recorder's* clock, which drifts from the phone, so a
         // real meeting can fall outside the match window. That is precisely the
         // case the picker recovers — see `CalendarMatching.defaultTolerance`.
-        let match = userOwnsCalendarLink ? nil : matchingCalendarEvent(for: recording)
+        let match = userOwnsCalendarLink ? nil : await matchingCalendarEvent(for: recording)
         let confidentEvent = match?.confidence == .high ? match?.event : nil
 
         // A recurring calendar event *is* a meeting series, and its external
@@ -133,7 +133,14 @@ final class AutoOrganizer {
             }
             switch source {
             case .calendar(let title), .ai(let title):
-                if !title.isEmpty { rec.title = title }
+                if !title.isEmpty {
+                    rec.title = title
+                    // The app chose this title, so a later manual meeting link is
+                    // free to adopt the meeting's name over it. `.userTyped` never
+                    // reaches here (see `select`), so the user's own title keeps
+                    // its source untouched.
+                    rec.titleSource = .auto
+                }
             case .userTyped, .none:
                 break
             }
@@ -283,10 +290,10 @@ final class AutoOrganizer {
     /// Attendee names are personal data and are never logged.
     private func matchingCalendarEvent(
         for recording: Recording
-    ) -> (event: CandidateEvent, confidence: CalendarMatching.MatchConfidence)? {
+    ) async -> (event: CandidateEvent, confidence: CalendarMatching.MatchConfidence)? {
         guard DeliverySettings.shared.calendarTitles else { return nil }
         guard CalendarMatcher.shared.canReadEvents else { return nil }
-        return CalendarMatcher.shared.evaluate(
+        return await CalendarMatcher.shared.evaluate(
             recordingStart: recording.createdAt,
             duration: recording.duration)
     }
@@ -299,19 +306,21 @@ final class AutoOrganizer {
         let list = categories
             .map { "- \($0.name): \($0.guidance)" }
             .joined(separator: "\n")
-        let instructions = """
-        You organize the user's voice recordings. Read the transcript of one \
-        recording and decide which single category fits it best. The categories, \
-        with guidance on when each applies:
-        \(list)
-
-        TRANSCRIPT:
-        \(Self.cap(text))
-        """
+        // Routed through `PromptStore` so Settings › AI › Prompts can edit both the
+        // classifier instructions and its one-line request; the matching
+        // `PromptDefaults` entries are the fallback for the impossible case of the
+        // catalogue having lost an id.
+        let values = ["categories": list, "transcript": Self.cap(text)]
+        let editedInstructions = PromptStore.shared.filled(PromptID.organizeClassify, with: values)
+        let instructions = editedInstructions.isEmpty
+            ? PromptTemplating.filled(PromptDefaults.organizeClassify, with: values)
+            : editedInstructions
+        let editedRequest = PromptStore.shared.text(for: PromptID.organizeRequest)
+        let request = editedRequest.isEmpty ? PromptDefaults.organizeRequest : editedRequest
         let session = LanguageModelSession(instructions: instructions)
         do {
             let response = try await session.respond(
-                to: "Pick the single best category and write a title of at most six words.",
+                to: request,
                 generating: Classification.self)
             return response.content
         } catch {

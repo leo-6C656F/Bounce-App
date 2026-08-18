@@ -116,6 +116,25 @@ enum DueDateResolver {
         """
     }
 
+    /// The placeholder values for the `dueDateRules` prompt template
+    /// (`PromptDefaults.dueDateRules`), keyed by the token names that template uses.
+    ///
+    /// Exposed so the caller — `ActionItemExtractor`, which owns the `PromptStore`
+    /// routing — can fill the user-editable template with the same date anchors
+    /// `instructions` bakes into its literal. Kept here, and pure, so both the
+    /// literal fallback and the template are computed from one source and can't
+    /// drift; `DueDateResolver` deliberately never imports `PromptStore`, so
+    /// `tools/due-date-tests` can drive it standalone.
+    static func ruleValues(recordedAt: Date, calendar: Calendar) -> [String: String] {
+        [
+            "recorded_date": spelledOut(recordedAt, calendar: calendar),
+            "today": isoDay(recordedAt, calendar: calendar),
+            "tomorrow": isoDay(byAdding: 1, to: recordedAt, calendar: calendar),
+            "next_week": isoDay(byAdding: 7, to: recordedAt, calendar: calendar),
+            "month_end": isoDay(endOfMonthFor: recordedAt, calendar: calendar),
+        ]
+    }
+
     // MARK: - Parsing
 
     /// The `Date` `raw` denotes, or nil if it is missing, malformed or

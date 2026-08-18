@@ -192,7 +192,7 @@ struct PlaudAuthService {
 
         guard (200...299).contains(http.statusCode) else {
             let body = String(data: data, encoding: .utf8) ?? ""
-            AuthLog.log("✗ HTTP \(http.statusCode): \(body.prefix(400))")
+            AuthLog.log("✗ HTTP \(http.statusCode): \(AuthLog.redactingSecrets(body).prefix(400))")
             if http.statusCode == 401 || http.statusCode == 403 { throw Failure.invalidCredentials }
             throw Failure.http(http.statusCode, body)
         }
@@ -200,8 +200,12 @@ struct PlaudAuthService {
         guard let decoded = try? JSONDecoder().decode(T.self, from: data) else {
             // The most likely failure if Plaud's response shape differs from
             // what we expect, so log the raw body — it is the only way to tell
-            // a schema mismatch from a genuine error.
-            AuthLog.log("✗ couldn't decode response: \(String(data: data, encoding: .utf8)?.prefix(400) ?? "<binary>")")
+            // a schema mismatch from a genuine error. But this path fires on a
+            // 2xx, whose body carries the freshly minted token, so redact the
+            // token/secret values first: the module's own rule is "never print a
+            // token," and the keys and structure are what the diagnosis needs.
+            let raw = String(data: data, encoding: .utf8) ?? "<binary>"
+            AuthLog.log("✗ couldn't decode response: \(AuthLog.redactingSecrets(raw).prefix(400))")
             throw Failure.malformedResponse
         }
         return decoded

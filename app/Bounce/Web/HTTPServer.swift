@@ -301,7 +301,18 @@ struct HTTPRequest: Sendable {
             // curl still works.
             guard let origin = header("origin"), !origin.isEmpty else { return false }
             guard let host = hostName else { return true }
-            return !origin.lowercased().contains(host.lowercased())
+            // **Host EQUALITY, never a substring match.** `.contains` reads
+            // `http://192.168.1.42.attacker.com` as same-site because its host
+            // *contains* `192.168.1.42` — a cross-site page slips straight
+            // through the one gate that guards pre-auth `POST /api/pair`. Parse
+            // the Origin and require its host equal the Host header the request
+            // is already validated against. Brackets are trimmed so an IPv6
+            // literal (`[::1]` in Host, `::1` from `URLComponents`) still matches.
+            guard let originHost = URLComponents(string: origin)?.host else { return true }
+            let brackets = CharacterSet(charactersIn: "[]")
+            let originKey = originHost.lowercased().trimmingCharacters(in: brackets)
+            let hostKey = host.lowercased().trimmingCharacters(in: brackets)
+            return originKey != hostKey
         }
         return site != "same-origin" && site != "none"
     }
@@ -495,6 +506,10 @@ final class HTTPConnection: @unchecked Sendable {
     private let stateLock = NSLock()
     private var _isClosed = false
     private var _isEventStream = false
+    /// True while a live frame is handed to the transport but not yet processed.
+    /// The backpressure gate for `sendEvent`: a second frame arriving while one
+    /// is in flight is dropped rather than enqueued. See `sendEvent`.
+    private var _sendInFlight = false
 
     private var isClosed: Bool { stateLock.withLock { _isClosed } }
     private var isEventStream: Bool { stateLock.withLock { _isEventStream } }
@@ -772,6 +787,23 @@ final class HTTPConnection: @unchecked Sendable {
     /// `NWConnection.send`, which is itself thread-safe.
     func sendEvent(_ payload: String) {
         guard isEventStream, !isClosed else { return }
+        // Backpressure. At most one live frame is in flight at a time: if the
+        // previous send hasn't reached the transport yet, DROP this one instead
+        // of enqueuing it. `LiveChannel` pushes up to 4 Hz, and every frame is an
+        // idempotent snapshot (live/status) or a refetch signal (library), so the
+        // next tick carries the freshest state regardless. Without this, a laptop
+        // on congested wifi lets frames pile up unacknowledged inside
+        // `NWConnection` and the phone's memory climbs until keepalive kills the
+        // peer. This is the same "wait for the previous chunk" discipline `pump`
+        // uses for file streaming, reduced to a drop because a live frame is
+        // disposable where a file byte is not.
+        let mayScheduleSend: Bool = stateLock.withLock {
+            guard !_sendInFlight else { return false }
+            _sendInFlight = true
+            return true
+        }
+        guard mayScheduleSend else { return }
+
         // Every line of a multi-line payload needs its own `data:` prefix, and
         // a blank line terminates the event.
         let framed = payload
@@ -779,8 +811,9 @@ final class HTTPConnection: @unchecked Sendable {
             .map { "data: \($0)" }
             .joined(separator: "\n") + "\n\n"
         connection.send(content: Data(framed.utf8), completion: .contentProcessed { [weak self] error in
-            guard error != nil, let self else { return }
-            self.close()
+            guard let self else { return }
+            self.stateLock.withLock { self._sendInFlight = false }
+            if error != nil { self.close() }
         })
     }
 

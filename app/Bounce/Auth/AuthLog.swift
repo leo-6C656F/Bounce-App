@@ -35,4 +35,27 @@ enum AuthLog {
     static func tokenSummary(_ token: String) -> String {
         token.isEmpty ? "<empty>" : "<\(token.count) chars>"
     }
+
+    /// Strip secret *values* out of a JSON-ish response body before it reaches a
+    /// log line.
+    ///
+    /// The decode-mismatch path logs the raw body so a schema change can be told
+    /// from a genuine error — but on a 2xx that body carries the freshly minted
+    /// `access_token`, and "never print a token" is the module's own rule. This
+    /// keeps the keys and structure visible (which is what the diagnosis needs)
+    /// while replacing the value after any sensitive key with `<redacted>`.
+    static func redactingSecrets(_ body: String) -> String {
+        let sensitiveKeys = ["access_token", "refresh_token", "token", "secret_key", "secret"]
+        var result = body
+        for key in sensitiveKeys {
+            // Matches `"key" : "value"` (any spacing) and rewrites only the value.
+            let pattern = "(\"\(key)\"\\s*:\\s*\")[^\"]*(\")"
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
+            else { continue }
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(
+                in: result, options: [], range: range, withTemplate: "$1<redacted>$2")
+        }
+        return result
+    }
 }

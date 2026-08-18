@@ -447,41 +447,22 @@ enum MP3Frames {
         to destination: URL
     ) throws -> Output {
         let frameRanges = try selectFrames(in: index, covering: ranges)
-        var payload = Data()
-        let keptFrames = try appendFrames(frameRanges, of: index, from: source, into: &payload)
 
-        // A Xing header is only worth the risk on a variable-bitrate stream. On
-        // CBR — which is what the recorder produces — `AVAudioPlayer` derives an
-        // exact duration from file size and bitrate, and a hand-built metadata
-        // frame could only add a frame of silence at the head for nothing.
-        //
-        // The CBR path writes `payload` directly rather than copying it into a
-        // second buffer: an hour of 32 kbps mono is ~14 MB, and the copy doubled
-        // peak memory for a prefix that isn't there.
-        var output = payload
-        if index.isVariableBitRate,
-           let xing = xingFrame(index: index, frameCount: keptFrames, byteCount: payload.count) {
-            output = xing
-            output.append(payload)
-        }
-
-        do {
-            // Explicit protection class, not the platform default — same
-            // reasoning as `RecordingStore.save()`: this is the recording's
-            // actual audio, and `.untilFirstUserAuthentication` is the
-            // strongest class that doesn't risk failing a write triggered by a
-            // background BLE sync before the phone's first unlock since boot.
-            try output.write(
-                to: destination,
-                options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-        } catch {
-            throw Failure.writeFailed(error.localizedDescription)
-        }
+        // Stream the kept frames straight to disk rather than accumulating the
+        // whole output in a resident `Data` (S-14). A Xing header is only worth
+        // the risk on a variable-bitrate stream: on the CBR the recorder produces,
+        // `AVAudioPlayer` derives an exact duration from file size and bitrate, and
+        // a hand-built metadata frame could only add a frame of silence at the head
+        // for nothing.
+        let totals = try streamWrite(
+            [FramePlan(url: source, index: index, frameRanges: frameRanges)],
+            xingTemplate: index.isVariableBitRate ? index : nil,
+            to: destination)
 
         return Output(
             url: destination,
             duration: duration(of: frameRanges, in: index),
-            byteCount: output.count,
+            byteCount: totals.byteCount,
             keptRanges: keptRanges(of: frameRanges, in: index))
     }
 
@@ -548,24 +529,22 @@ enum MP3Frames {
             else { throw Failure.formatMismatch }
         }
 
-        var payload = Data()
         var placements: [Placement] = []
-        var writtenFrames = 0
         var elapsed: TimeInterval = 0
+        var plan: [FramePlan] = []
 
         for source in sources {
             let ranges = source.ranges.isEmpty
                 ? [0...max(source.index.duration, 0)]
                 : source.ranges
             let frameRanges = try selectFrames(in: source.index, covering: ranges)
-            writtenFrames += try appendFrames(
-                frameRanges, of: source.index, from: source.url, into: &payload)
             let span = duration(of: frameRanges, in: source.index)
             placements.append(Placement(
                 start: elapsed,
                 duration: span,
                 keptRanges: keptRanges(of: frameRanges, in: source.index)))
             elapsed += span
+            plan.append(FramePlan(url: source.url, index: source.index, frameRanges: frameRanges))
         }
 
         // Bitrate is the one header field allowed to vary between sources — that
@@ -576,27 +555,18 @@ enum MP3Frames {
         let bitrates = Set(sources.compactMap { $0.index.frames.first?.bitrate })
         let isVBR = bitrates.count > 1 || sources.contains { $0.index.isVariableBitRate }
 
-        var output = payload
-        if isVBR,
-           let xing = xingFrame(
-            index: first.index, frameCount: writtenFrames, byteCount: payload.count) {
-            output = xing
-            output.append(payload)
-        }
-
-        do {
-            // Same explicit protection class as `write(source:keeping:to:)` above.
-            try output.write(
-                to: destination,
-                options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-        } catch {
-            throw Failure.writeFailed(error.localizedDescription)
-        }
+        // Stream to disk rather than concatenating the whole output resident
+        // (S-14): a 30-part join of hour-long files would otherwise build a
+        // ~400 MB buffer and be killed by jetsam mid-merge. The Xing frame, when
+        // one is written, is reserved up front and patched with the true totals
+        // once the frames are on disk.
+        let totals = try streamWrite(
+            plan, xingTemplate: isVBR ? first.index : nil, to: destination)
 
         return MergeOutput(
             url: destination,
             duration: elapsed,
-            byteCount: output.count,
+            byteCount: totals.byteCount,
             placements: placements)
     }
 
@@ -631,31 +601,114 @@ enum MP3Frames {
         return frameRanges
     }
 
-    /// Copy the bytes of `frameRanges` onto `payload`, returning how many frames
-    /// were appended.
+    /// One source's contribution to a streamed write: which frames of which
+    /// mapped file to copy, in order.
+    private struct FramePlan {
+        let url: URL
+        let index: Index
+        let frameRanges: [Range<Int>]
+    }
+
+    /// Bytes buffered before a flush to the file handle. Keeps peak memory to this
+    /// plus the mapped source, rather than the whole output — the point of S-14 —
+    /// while still writing in large chunks instead of a syscall per frame.
+    private static let flushThreshold = 4 * 1024 * 1024
+
+    /// Stream the selected frames of each source to `destination`, optionally
+    /// prefixed by a Xing frame patched from the final totals. Returns the frame
+    /// and byte counts written.
     ///
-    /// The file is mapped rather than read: a merge holds several sources at once,
-    /// and an hour of 32 kbps mono is ~14 MB each.
-    private static func appendFrames(
-        _ frameRanges: [Range<Int>],
-        of index: Index,
-        from url: URL,
-        into payload: inout Data
-    ) throws -> Int {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
-            throw Failure.unreadable
+    /// This is the memory-bounded replacement for accumulating the whole output in
+    /// a resident `Data` (S-14). Sources are memory-mapped and copied a bounded
+    /// buffer at a time; the output never exists in RAM in full, so a large or
+    /// many-part merge can't jetsam mid-write.
+    ///
+    /// The Xing frame has to sit at the head, but its `frameCount`/`byteCount`
+    /// fields aren't known until every frame is written. Its *length* is fixed by
+    /// the stream, though (`xingFrame` picks the bitrate from the version table,
+    /// not from the totals), so a placeholder is reserved first and overwritten in
+    /// place once the totals are in.
+    ///
+    /// Writes to a sibling temp file and moves it into place, so a crash mid-write
+    /// can't leave a half-written file where the destination is — the atomicity the
+    /// old single `Data.write(.atomic)` gave. The explicit protection class matches
+    /// that write's (`RecordingStore.save`'s reasoning): this is the recording's
+    /// audio, and `.completeUntilFirstUserAuthentication` is the strongest class
+    /// that won't fail a background-BLE-sync write before the first unlock. It's
+    /// best-effort so the macOS `tools/audio-edit-tests` harness, where file
+    /// protection is a no-op, still runs.
+    @discardableResult
+    private static func streamWrite(
+        _ plan: [FramePlan],
+        xingTemplate: Index?,
+        to destination: URL
+    ) throws -> (frameCount: Int, byteCount: Int) {
+        let tempURL = destination.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).mp3.partial")
+
+        guard FileManager.default.createFile(atPath: tempURL.path, contents: nil) else {
+            throw Failure.writeFailed("couldn't create the output file")
         }
-        payload.reserveCapacity(payload.count + frameRanges.reduce(0) { total, range in
-            total + index.frames[range].reduce(0) { $0 + $1.byteLength }
-        })
-        var appended = 0
-        for range in frameRanges {
-            for frame in index.frames[range] {
-                payload.append(data[frame.byteOffset..<(frame.byteOffset + frame.byteLength)])
-                appended += 1
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: tempURL.path)
+
+        func cleanUp() { try? FileManager.default.removeItem(at: tempURL) }
+
+        do {
+            let handle = try FileHandle(forWritingTo: tempURL)
+
+            // Reserve the Xing frame up front; its length is fixed for the stream,
+            // so the real one (below) overwrites it in place once totals are known.
+            let placeholder = xingTemplate.flatMap { xingFrame(index: $0, frameCount: 0, byteCount: 0) }
+            if let placeholder { try handle.write(contentsOf: placeholder) }
+
+            var writtenFrames = 0
+            var payloadBytes = 0
+            var buffer = Data()
+            buffer.reserveCapacity(flushThreshold)
+
+            for entry in plan {
+                guard let data = try? Data(contentsOf: entry.url, options: .mappedIfSafe) else {
+                    throw Failure.unreadable
+                }
+                for range in entry.frameRanges {
+                    for frame in entry.index.frames[range] {
+                        buffer.append(data[frame.byteOffset..<(frame.byteOffset + frame.byteLength)])
+                        writtenFrames += 1
+                        payloadBytes += frame.byteLength
+                        if buffer.count >= flushThreshold {
+                            try handle.write(contentsOf: buffer)
+                            buffer.removeAll(keepingCapacity: true)
+                        }
+                    }
+                }
             }
+            if !buffer.isEmpty { try handle.write(contentsOf: buffer) }
+
+            // Patch the reserved Xing frame with the real totals (same length).
+            if placeholder != nil,
+               let xing = xingTemplate.flatMap({
+                   xingFrame(index: $0, frameCount: writtenFrames, byteCount: payloadBytes)
+               }) {
+                try handle.seek(toOffset: 0)
+                try handle.write(contentsOf: xing)
+            }
+            try handle.close()
+
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.moveItem(at: tempURL, to: destination)
+
+            return (writtenFrames, payloadBytes + (placeholder?.count ?? 0))
+        } catch let failure as Failure {
+            cleanUp()
+            throw failure
+        } catch {
+            cleanUp()
+            throw Failure.writeFailed(error.localizedDescription)
         }
-        return appended
     }
 
     /// The playing time of the selected frames.

@@ -79,6 +79,9 @@ struct AskView: View {
             }
             .navigationTitle("Ask")
             .toolbarTitleDisplayMode(.inline)
+            // Leaving the tab mid-answer should stop the stream, not let it run to
+            // completion writing into @State nobody is watching (S-21).
+            .onDisappear { answerTask?.cancel() }
             .toolbar {
                 if !turns.isEmpty {
                     ToolbarItem(placement: .topBarTrailing) {
@@ -326,19 +329,29 @@ struct AskView: View {
         let question = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty, !qa.isAnswering else { return }
 
-        // Which recordings the question is about, and the text to ground on.
-        // Shared with the desktop view via `AskCorpus` so both ask the same
-        // question of the same corpus.
-        let grounding = AskCorpus.grounding(for: question, in: model.recordings)
-        var turn = Turn(question: question)
-        turn.sources = grounding.sources
+        // Show the turn immediately (as "Thinking…") so the screen reacts on tap;
+        // sources fill in once grounding returns, and they aren't drawn until the
+        // answer finishes anyway.
+        let turn = Turn(question: question)
         turns.append(turn)
         let id = turn.id
         query = ""
 
-        qa.ground(on: grounding.corpus)
+        let recordings = model.recordings
         answerTask?.cancel()
         answerTask = Task {
+            // Which recordings the question is about, and the text to ground on.
+            // Shared with the desktop view via `AskCorpus` so both ask the same
+            // question of the same corpus. Run **off the main actor** (S-9): it
+            // scans and (via the cache) lowercases transcripts and concatenates up
+            // to 20 of them, which froze the tap on a large library.
+            let grounding = await Task.detached(priority: .userInitiated) {
+                AskCorpus.grounding(for: question, in: recordings)
+            }.value
+            guard !Task.isCancelled else { return }
+            update(id) { $0.sources = grounding.sources }
+
+            qa.ground(on: grounding.corpus)
             // No animation: the snapshots are cumulative, so animating each one
             // cross-fades the whole paragraph ~20x/second on a long answer,
             // which reads as flicker rather than a smooth stream.

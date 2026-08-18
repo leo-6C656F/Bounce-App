@@ -218,6 +218,9 @@ enum ReminderPlanning {
         return plan
     }
 
+    // See `ReminderSendReport` for the explicit-Send messaging and the truthful-
+    // "Sent" rollback, both kept pure here so the tests can exercise them.
+
     /// `existing` advanced by everything `plan` is about to do, to be carried into
     /// the next pass as `lastSeen`.
     ///
@@ -237,5 +240,61 @@ enum ReminderPlanning {
         for reminderId in plan.toUncomplete { result[reminderId] = false }
         for reminderId in created { result[reminderId] = false }
         return result
+    }
+}
+
+/// Turning a Reminders write outcome into what an explicit **Send** should tell
+/// the user, and which tasks must not keep a "Sent" badge after a failed write.
+///
+/// Pure and EventKit-free — the same reason `ReminderPlanning` is — so
+/// `tools/reminders-sync-tests` can exercise the message wording and the rollback
+/// rule without a device. `RemindersSync.sync` supplies the counts and the failed
+/// ids; `AppModel.pushActionItems` applies these.
+///
+/// Only the explicit send surfaces anything. A background foreground sync runs the
+/// same reconciliation but says nothing, so this is called from the push path
+/// alone.
+enum ReminderSendReport {
+
+    /// What to show after a Send, or `nil` for "say nothing" — a pass that neither
+    /// added a reminder nor failed to (Reminders wasn't the destination in play,
+    /// or only a completion flowed back).
+    struct Message: Equatable {
+        var title: String
+        var body: String
+        /// A failure the user needs to act on, vs. a plain confirmation. Lets the
+        /// UI style or label the two differently.
+        var isError: Bool
+    }
+
+    /// The message for `added` reminders created and `failed` that couldn't be
+    /// written. Failure wins when both happen — it is the half the user must act
+    /// on, and a mixed pass is rare.
+    static func message(added: Int, failed: Int) -> Message? {
+        if failed > 0 {
+            let what = failed == 1 ? "the task" : "\(failed) tasks"
+            return Message(
+                title: "Couldn’t add to Reminders",
+                body: "Bounce couldn’t add \(what) to Reminders — the selected list may have been deleted. Pick a list in Settings › Integrations & Delivery, then send again.",
+                isError: true)
+        }
+        if added > 0 {
+            let body = added == 1 ? "Added 1 task to Reminders." : "Added \(added) tasks to Reminders."
+            return Message(title: "Added to Reminders", body: body, isError: false)
+        }
+        return nil
+    }
+
+    /// The `ActionItem.id`s to un-send after a failed write — their "Sent" badge
+    /// would be a lie.
+    ///
+    /// **Only when Reminders was the single enabled destination.** The
+    /// `pushRequested` flag is shared across Reminders, Calendar and the webhook,
+    /// so clearing it when another destination is on could un-send a task that
+    /// *did* reach Calendar or the webhook. With another destination in play the
+    /// badge stays and the failure is surfaced by `message` alone; with Reminders
+    /// the only one, the failed items are genuinely un-sent.
+    static func idsToUnsend(failedToCreate: [String], remindersIsOnlyDestination: Bool) -> [String] {
+        remindersIsOnlyDestination ? failedToCreate : []
     }
 }

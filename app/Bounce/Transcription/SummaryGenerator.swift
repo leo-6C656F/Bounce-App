@@ -55,15 +55,16 @@ final class SummaryGenerator {
             }
             let context = Self.cap(transcript)
 
-            let instructions = """
-            You summarize a transcript of a recording the user made. Follow the \
-            user's instruction exactly, basing everything only on the transcript. \
-            Reply in plain text — you may use simple "- " bullet lines where the \
-            instruction asks for a list, but never JSON or code.
-
-            TRANSCRIPT:
-            \(context)
-            """
+            // Routed through `PromptStore` so Settings › AI › Prompts can edit the
+            // grounding wrapper; `PromptDefaults.summaryGrounding` is the fallback
+            // for the impossible case of the catalogue having lost the id. The
+            // *template's* own prompt (`template.prompt`) stays out of this — it is
+            // separately editable via `TemplateStore`.
+            let values = ["transcript": context]
+            let edited = PromptStore.shared.filled(PromptID.summaryGrounding, with: values)
+            let instructions = edited.isEmpty
+                ? PromptTemplating.filled(PromptDefaults.summaryGrounding, with: values)
+                : edited
             let session = LanguageModelSession(instructions: instructions)
 
             isGenerating = true

@@ -151,6 +151,20 @@ final class DesktopServer {
     /// Guards against a second `start()` while the first is still waiting on a
     /// keypair.
     private var isStarting = false
+    /// Monotonic id for each `start()`. `bringUp` captures the value current when
+    /// it launched and re-checks it after the (seconds-long, off-actor) RSA
+    /// keygen await; a `stop()` in that window bumps the counter, so the resumed
+    /// `bringUp` sees a mismatch and bails instead of bringing a listener up that
+    /// was already told to stop. `isStarting` alone couldn't express this — it is
+    /// a single bool, and a stop→start pair inside the await window would leave it
+    /// `true` again with no way to tell the two starts apart.
+    private var startToken = 0
+    /// Set when the server was stopped on backgrounding purely because nothing
+    /// could hold it up (no residency, no active recording) — the feature is
+    /// still enabled and its sessions were kept. On foreground this is what tells
+    /// `returnToForeground` to bring the server back, closing the "dead URL after
+    /// a brief app-switch" gap. Cleared when the user switches the feature off.
+    private var suspendedForBackground = false
 
     /// Certificate work, off the main actor.
     ///
@@ -187,17 +201,29 @@ final class DesktopServer {
 
     func start() {
         guard !isRunning, !isStarting else { return }
+        launchBringUp(advertiseService: true)
+    }
+
+    /// Stamp a fresh `startToken`, mark the start in flight, and launch `bringUp`
+    /// bound to that token. The single entry point for both `start()` and the
+    /// Bonjour-failure retry, so neither can forget to advance the token.
+    private func launchBringUp(advertiseService: Bool) {
+        startToken &+= 1
+        let token = startToken
         isStarting = true
-        Task { await bringUp(advertiseService: true) }
+        Task { await bringUp(advertiseService: advertiseService, token: token) }
     }
 
     /// Async because minting the TLS certificate generates an RSA keypair, which
     /// takes long enough on device to hang the UI if done inline — and the
     /// watchdog kills an app that hangs the main thread for a few seconds. The
     /// keygen runs detached; everything else here stays on the main actor.
-    private func bringUp(advertiseService: Bool) async {
-        defer { isStarting = false }
-        guard !isRunning else { return }
+    private func bringUp(advertiseService: Bool, token: Int) async {
+        // Only clear `isStarting` if this is still the current start — a newer
+        // `launchBringUp` (or a `stop`) has already taken ownership of the flag
+        // otherwise, and clearing it here would stomp that.
+        defer { if token == startToken { isStarting = false } }
+        guard token == startToken, !isRunning else { return }
         guard let model else {
             lastError = "Desktop view isn't wired up yet."
             return
@@ -228,9 +254,11 @@ final class DesktopServer {
         if useTLS {
             do {
                 identity = try await Self.tlsIdentity(for: hostNames)
-                // Re-check: the user may have switched it off again while the
-                // keypair was being generated.
-                guard !isRunning, isStarting else { return }
+                // Re-check against the start token: the user may have switched it
+                // off (which bumps `startToken` in `stop`) while the keypair was
+                // being generated. Without this the guard's old `isStarting` could
+                // still read true and the listener would come up despite the stop.
+                guard token == startToken, !isRunning else { return }
             } catch {
                 // Encryption is a promise the UI makes, so failing to keep it is
                 // not something to paper over by quietly serving cleartext.
@@ -266,8 +294,7 @@ final class DesktopServer {
                         if advertiseService, Self.isBonjourFailure(error) {
                             self.stop(keepingSessions: true)
                             self.isDiscoverable = false
-                            self.isStarting = true
-                            Task { await self.bringUp(advertiseService: false) }
+                            self.launchBringUp(advertiseService: false)
                             return
                         }
                         self.lastError = Self.describe(error)
@@ -289,6 +316,11 @@ final class DesktopServer {
         }
 
         isRunning = true
+        // A fresh, running listener supersedes any "restore me" marker: it is only
+        // meaningful in the window between an auto-suspend and the next foreground,
+        // and a stale one would make `returnToForeground` skip its `isListening`
+        // repair on a later residency-held cycle.
+        suspendedForBackground = false
         // The scheme has to match what is actually being served: pointing a
         // browser at http:// against a TLS listener fails the handshake with an
         // error that reads like the server is broken.
@@ -310,7 +342,19 @@ final class DesktopServer {
     /// `keepingSessions` preserves paired browsers so foregrounding restores
     /// them; the user switching the feature off clears everything.
     func stop(keepingSessions: Bool = false) {
-        guard isRunning || api != nil else { return }
+        // `isStarting` in the guard so a stop *during* TLS keygen isn't a no-op:
+        // `bringUp` has already set `self.api` before the await, so `api != nil`
+        // covers it too, but a start that hasn't reached that line yet would slip
+        // through without it.
+        guard isRunning || api != nil || isStarting else { return }
+        // Cancel any in-flight `bringUp`: clear the flag and advance the token so
+        // the keygen, when it finishes, sees a mismatch and doesn't start a
+        // listener we've just been told to stop.
+        isStarting = false
+        startToken &+= 1
+        // A user switching the feature off is the one path that should *not*
+        // restore on foreground; a background auto-suspend keeps the marker.
+        if !keepingSessions { suspendedForBackground = false }
         watchdog?.cancel()
         watchdog = nil
         live.closeAll()
@@ -344,8 +388,16 @@ final class DesktopServer {
     /// the user glanced at a notification. Sessions are kept so foregrounding
     /// doesn't force a fresh six-digit code into every browser.
     func handleScenePhase(isBackground: Bool) {
-        guard isRunning else { return }
-        isBackground ? enterBackground() : returnToForeground()
+        if isBackground {
+            // Nothing to suspend if it isn't running.
+            guard isRunning else { return }
+            enterBackground()
+        } else {
+            // Deliberately *not* guarded on `isRunning`: the whole point of A17's
+            // fix is that the server may have been stopped on the way into the
+            // background and must be restarted here. `returnToForeground` decides.
+            returnToForeground()
+        }
     }
 
     private func enterBackground() {
@@ -372,10 +424,25 @@ final class DesktopServer {
             return
         }
 
+        // Nothing can hold the process up, so the socket is about to die with the
+        // app. Stop cleanly but keep the paired browsers, and remember that the
+        // feature is still enabled so foregrounding restarts it rather than
+        // leaving a dead URL — the bug A17 describes: a five-second glance at
+        // another app used to switch the server off for good.
         stop(keepingSessions: true)
+        suspendedForBackground = true
     }
 
     private func returnToForeground() {
+        // Restart a server that was suspended on the way into the background. The
+        // certificate is cached so this is cheap, and the browser's `EventSource`
+        // reconnects on its own.
+        if suspendedForBackground {
+            suspendedForBackground = false
+            WebLog.log("foregrounded — restarting server that was suspended on background")
+            start()
+            return
+        }
         guard let since = stayedUpInBackgroundSince else { return }
         stayedUpInBackgroundSince = nil
         let seconds = Int(Date().timeIntervalSince(since))

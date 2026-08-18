@@ -35,6 +35,12 @@ struct BounceApp: App {
                     // the idle timer disabled. `.background` only — `.inactive`
                     // fires for Control Centre and notification banners.
                     DesktopServer.shared.handleScenePhase(isBackground: phase == .background)
+                    // Library saves are off-main and debounced, so a mutation in
+                    // the last ~150 ms before suspension could still be in flight.
+                    // Force it to disk synchronously before the OS can suspend us.
+                    // `.inactive` (not just `.background`) so a mutation made right
+                    // before an app-switch or lock is durable too.
+                    if phase != .active { RecordingStore.shared.flush() }
                 }
         }
     }

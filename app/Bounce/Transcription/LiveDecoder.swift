@@ -103,6 +103,20 @@ actor LiveDecoder {
     /// to a packet count.
     static let pcmBytesPerPacket = 640
 
+    /// Most Opus packets one streaming slice will decode, so a catch-up backlog
+    /// can't be decoded in a single blocking slice.
+    ///
+    /// A relaunch restores a checkpointed buffer whose assembled audio can sit
+    /// minutes ahead of the committed cursor, and a mid-file resume the recorder
+    /// restarts from 0 re-delivers a large prefix at once. Without a cap the first
+    /// slice decodes that entire backlog — a multi-second Opus decode and a
+    /// multi-MB PCM allocation handed downstream in one burst, observed on device
+    /// as the app freezing when a long recording is resumed. 3000 packets is 60 s
+    /// of audio (~1.9 MB PCM, ~120 ms Opus decode on device), so at the streaming
+    /// cadence the transcript still catches up to real time within a few slices
+    /// while no single slice stalls.
+    static let maxPacketsPerSlice = 3000
+
     /// Rewind the cursor to audio already transcribed in an earlier run, so a
     /// resumed session decodes only what is new.
     ///
@@ -164,6 +178,16 @@ actor LiveDecoder {
     /// keystream-offset arithmetic to get wrong. The linear win is that only *new*
     /// Opus packets are decoded; the codec instance is reused so inter-frame
     /// prediction carries across slices.
+    ///
+    /// **The parse, though, still walks the whole plaintext each slice, and it has
+    /// to** (S-12): `OggOpusParser` assigns page roles by index within the buffer
+    /// it is given, so a windowed parse starting mid-file loses OpusHead/OpusTags
+    /// and the stream config — a silent-corruption class this design already pays a
+    /// full re-decrypt to avoid. Rather than trade that for incremental-parse
+    /// arithmetic (or an incremental decrypt whose cached plaintext would diverge
+    /// from a late-backfilled hole), the residual O(n²) is bounded by stretching
+    /// the slice cadence with buffer size — see
+    /// `LiveStreamAssembler.suggestedSliceInterval`.
     private func decodeStreaming(file: Data, privateKey: String) -> StreamResult {
         var timing = PhaseTimer()
 
@@ -213,7 +237,16 @@ actor LiveDecoder {
         timing.mark("parse")
         guard packets.count > packetsDecoded else { return .nothingNew }
 
-        let newPackets = Array(packets[packetsDecoded...])
+        // Decode at most `maxPacketsPerSlice` so a catch-up backlog (relaunch
+        // restore, or a resume the recorder restarts from 0) can't be decoded in
+        // one blocking slice. The cursor advances by exactly what is emitted, so
+        // the next slice continues seamlessly — the reused `opusDecoder` carries
+        // inter-frame state across the seam — and the transcript catches up over a
+        // few ticks instead of one multi-second stall. Only the Opus decode is
+        // bounded here; the parse still walks the whole plaintext (a separate
+        // O(n²) concern the slice cadence handles).
+        let sliceEnd = min(packets.count, packetsDecoded + Self.maxPacketsPerSlice)
+        let newPackets = Array(packets[packetsDecoded..<sliceEnd])
         if opusDecoder == nil {
             opusDecoder = OpusStreamDecoder(channels: max(1, parser.parsedChannels))
         }
@@ -230,11 +263,14 @@ actor LiveDecoder {
         }
         timing.mark("opus")
 
-        packetsDecoded = packets.count
+        packetsDecoded = sliceEnd
         pcmBytesEmitted += pcm.count
         let seconds = Double(pcmBytesEmitted) / 32000
+        let backlog = packets.count - packetsDecoded
         TranscribeLog.log("decoder: streaming +\(newPackets.count) packet(s) → "
-            + "\(pcm.count) new PCM (\(String(format: "%.1f", seconds))s total) \(timing)")
+            + "\(pcm.count) new PCM (\(String(format: "%.1f", seconds))s total"
+            + (backlog > 0 ? ", \(backlog) packet(s) of backlog remaining" : "")
+            + ") \(timing)")
         return .output(Output(freshPCM: pcm, totalPCMBytes: pcmBytesEmitted, path: .streaming))
     }
 
