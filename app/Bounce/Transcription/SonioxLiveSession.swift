@@ -135,10 +135,18 @@ final class SonioxLiveSession: NSObject, @unchecked Sendable {
                 try? await Task.sleep(for: .seconds(4))
             }
             await group.next()   // whichever happens first
+
+            // Resume the parked continuation here, *inside* the group scope. If
+            // the timeout won, the continuation child is still blocked in a
+            // non-cancellation-aware `withCheckedContinuation` — `cancelAll()`
+            // can't wake it, and `withTaskGroup` implicitly awaits *all* children
+            // before returning, so without this the group (and `finish()`) would
+            // hang forever on a silent socket. `close()` is idempotent, so if a
+            // real `finished` already closed the session this is a no-op.
+            close()
             group.cancelAll()
         }
 
-        close()
         return currentSegments()
     }
 

@@ -432,22 +432,37 @@ final class SyncManager: NSObject {
 
 extension SyncManager: AudioExportCallback {
 
+    // The SDK invokes these on its own export-callback queue — unlike the file /
+    // download / WiFi callbacks in `DeviceManager`, which the SDK delivers there
+    // and which hop to main before forwarding here, this object is handed to the
+    // SDK as `callback: self`, so nothing hops for it. Every body below mutates
+    // the lock-free `RecordingStore` and/or publishes on Combine subjects read by
+    // `@MainActor` SwiftUI, so each hops to main itself — exactly as the sibling
+    // `WiFiExportHandler` already does for the identical protocol.
+
     func onProgress(_ progress: Int, message: String) {
-        guard let sessionId = currentSessionId else { return }
-        handleDownloadProgress(sessionId: sessionId, progress: progress)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let sessionId = self.currentSessionId else { return }
+            self.handleDownloadProgress(sessionId: sessionId, progress: progress)
+        }
     }
 
     func onComplete(outputPath: String) {
-        guard let sessionId = currentSessionId else { return }
-        currentSessionId = nil
-        handleDownloadComplete(sessionId: sessionId, outputPath: outputPath)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let sessionId = self.currentSessionId else { return }
+            self.currentSessionId = nil
+            self.handleDownloadComplete(sessionId: sessionId, outputPath: outputPath)
+        }
     }
 
     func onError(_ error: String) {
-        currentSessionId = nil
-        // WiFi has taken over, or is about to — BLE errors here are expected.
-        guard !expectingWiFiCallbacks, !isWiFiConnecting, !state.isWiFi else { return }
-        stateSubject.send(.failed("Transfer failed: \(error)"))
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.currentSessionId = nil
+            // WiFi has taken over, or is about to — BLE errors here are expected.
+            guard !self.expectingWiFiCallbacks, !self.isWiFiConnecting, !self.state.isWiFi else { return }
+            self.stateSubject.send(.failed("Transfer failed: \(error)"))
+        }
     }
 }
 
@@ -455,69 +470,92 @@ extension SyncManager: AudioExportCallback {
 
 extension SyncManager: PlaudWiFiAgentProtocol {
 
+    // The WiFi agent has its own delegate slot, so these land here directly on
+    // an SDK-internal queue — they do *not* pass through `DeviceManager`'s main
+    // hop the way the BLE callbacks do. Every body that mutates `RecordingStore`
+    // or publishes on a Combine subject hops to main itself, keeping the whole
+    // WiFi flow main-confined like the rest of the sync state (P0-1).
+
     func wifiHandshake(_ status: Int) {
-        guard status == 0 else {
-            // `tearDownWiFi()`, not just `setDeviceWiFi(open: false)` — leaving
-            // `expectingWiFiCallbacks`/`isWiFiConnecting` set to `true` after a
-            // failure means `startWiFiTransfer()`'s retry silently no-ops:
-            // `handleWiFiOpen`'s guard (`guard expectingWiFiCallbacks,
-            // !isWiFiConnecting`) fails on the stale flags, so a user who taps
-            // "try again" sees nothing happen at all.
-            stateSubject.send(.failed("WiFi handshake failed (status \(status))"))
-            tearDownWiFi()
-            return
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard status == 0 else {
+                // `tearDownWiFi()`, not just `setDeviceWiFi(open: false)` — leaving
+                // `expectingWiFiCallbacks`/`isWiFiConnecting` set to `true` after a
+                // failure means `startWiFiTransfer()`'s retry silently no-ops:
+                // `handleWiFiOpen`'s guard (`guard expectingWiFiCallbacks,
+                // !isWiFiConnecting`) fails on the stale flags, so a user who taps
+                // "try again" sees nothing happen at all.
+                self.stateSubject.send(.failed("WiFi handshake failed (status \(status))"))
+                self.tearDownWiFi()
+                return
+            }
+            self.stateSubject.send(.wifiTransferring(SyncProgress(totalFiles: 0, syncedFiles: 0, currentFileName: nil)))
+            PlaudWiFiAgent.shared.getFileList(Int(Date().timeIntervalSince1970), 0, false)
         }
-        stateSubject.send(.wifiTransferring(SyncProgress(totalFiles: 0, syncedFiles: 0, currentFileName: nil)))
-        PlaudWiFiAgent.shared.getFileList(Int(Date().timeIntervalSince1970), 0, false)
     }
 
     func wifiFileList(_ files: [BleFile]) {
-        let knownSessionIds = Set(RecordingStore.shared.recordings.filter(\.isSynced).map(\.sessionId))
-        let newFiles = files.map(RemoteFile.init).filter { !knownSessionIds.contains($0.sessionId) }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let knownSessionIds = Set(RecordingStore.shared.recordings.filter(\.isSynced).map(\.sessionId))
+            let newFiles = files.map(RemoteFile.init).filter { !knownSessionIds.contains($0.sessionId) }
 
-        guard !newFiles.isEmpty else {
-            tearDownWiFi()
-            stateSubject.send(.completed)
-            return
-        }
-
-        RecordingStore.shared.add(
-            newFiles.map {
-                Recording(
-                    sessionId: $0.sessionId,
-                    deviceSN: $0.deviceSN,
-                    duration: $0.duration,
-                    createdAt: $0.createdAt
-                )
+            guard !newFiles.isEmpty else {
+                self.tearDownWiFi()
+                self.stateSubject.send(.completed)
+                return
             }
-        )
-        refreshLibrary()
 
-        wifiPending = newFiles
-        wifiTotalToSync = newFiles.count
-        wifiSyncedCount = 0
-        wifiDownloadNext()
+            RecordingStore.shared.add(
+                newFiles.map {
+                    Recording(
+                        sessionId: $0.sessionId,
+                        deviceSN: $0.deviceSN,
+                        duration: $0.duration,
+                        createdAt: $0.createdAt
+                    )
+                }
+            )
+            self.refreshLibrary()
+
+            self.wifiPending = newFiles
+            self.wifiTotalToSync = newFiles.count
+            self.wifiSyncedCount = 0
+            self.wifiDownloadNext()
+        }
     }
 
     func wifiFileListFail(_ status: Int) {
-        // Same reasoning as `wifiHandshake`'s failure branch: without
-        // `tearDownWiFi()` here, a retry after this failure silently no-ops.
-        stateSubject.send(.failed("Couldn't list files over WiFi (status \(status))"))
-        tearDownWiFi()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            // Same reasoning as `wifiHandshake`'s failure branch: without
+            // `tearDownWiFi()` here, a retry after this failure silently no-ops.
+            self.stateSubject.send(.failed("Couldn't list files over WiFi (status \(status))"))
+            self.tearDownWiFi()
+        }
     }
 
     func wifiClose(_ status: Int) {
-        handleWiFiClose()
+        DispatchQueue.main.async { [weak self] in
+            self?.handleWiFiClose()
+        }
     }
 
     func wifiCommonErr(_ cmd: Int, _ status: Int) {
-        stateSubject.send(.failed("WiFi error (cmd \(cmd), status \(status))"))
-        tearDownWiFi()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.stateSubject.send(.failed("WiFi error (cmd \(cmd), status \(status))"))
+            self.tearDownWiFi()
+        }
     }
 
     func wifiClientFail() {
-        stateSubject.send(.failed("Couldn't reach the recorder over WiFi."))
-        tearDownWiFi()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.stateSubject.send(.failed("Couldn't reach the recorder over WiFi."))
+            self.tearDownWiFi()
+        }
     }
 
     // Unused, but part of the protocol.

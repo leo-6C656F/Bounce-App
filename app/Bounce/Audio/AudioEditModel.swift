@@ -206,28 +206,46 @@ final class AudioEditModel {
         progress = .analysing(0)
         notice = nil
         let url = sourceURL
+        // `duration` is the MP3 frame-index duration (set from `index.duration`
+        // at load). The detector reports speech in the decoded-PCM timeline, so
+        // the segments are scaled onto this one before they meet `kept` below.
+        let frameTimelineDuration = duration
 
-        let detected = await Task.detached(priority: .userInitiated) { () -> [SilenceDetector.Segment]? in
-            SilenceDetector.segments(of: url) { fraction in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    // Written out rather than `if case .analysing = self?.progress`,
-                    // which pattern-matches against a double optional and so never
-                    // matched — the bar sat at zero for the whole pass.
-                    guard case .analysing = self.progress else { return }
-                    self.progress = .analysing(fraction)
-                }
-            }
+        // `levels` + `segments(from:)` rather than the `segments(of:)` convenience
+        // so `levels.duration` (the decoded-PCM length) is in hand for the
+        // timeline conversion — intersecting the two timelines raw shifts every
+        // cut by the decoder delay/padding.
+        let detection = await Task.detached(priority: .userInitiated) {
+            () -> (ranges: [ClosedRange<TimeInterval>], decoded: TimeInterval)? in
+            guard let levels = SilenceDetector.levels(
+                of: url,
+                window: SilenceDetector.Options.default.window,
+                progress: { fraction in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        // Written out rather than `if case .analysing = self?.progress`,
+                        // which pattern-matches against a double optional and so never
+                        // matched — the bar sat at zero for the whole pass.
+                        guard case .analysing = self.progress else { return }
+                        self.progress = .analysing(fraction)
+                    }
+                }),
+                !levels.windows.isEmpty
+            else { return nil }
+            let speech = SilenceDetector.segments(from: levels)
+            return (
+                SilenceDetector.speechRanges(
+                    speech, decodedDuration: levels.duration, frameDuration: frameTimelineDuration),
+                levels.duration)
         }.value
 
         progress = nil
-        guard let detected, !detected.isEmpty else {
+        guard let detection, !detection.ranges.isEmpty else {
             notice = "Couldn't analyse this recording's audio."
             return
         }
 
-        let speech = detected.map { $0.start...$0.end }
-        let result = TimelineMap.intersect(kept, speech)
+        let result = TimelineMap.intersect(kept, detection.ranges)
         // Nothing worth cutting, or the detector read the whole recording as
         // silence. Leaving `kept` alone is the honest outcome either way — the
         // alternative is an edit the user didn't ask for that throws most of the

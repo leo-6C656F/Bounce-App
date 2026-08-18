@@ -21,9 +21,30 @@ final class RecordingStore {
     private let storeURL: URL
     private var cache: [Recording] = []
 
+    /// Set when `library.json` existed at launch but couldn't be decoded, *and*
+    /// the unreadable file couldn't be moved aside. While true, `save()` refuses
+    /// to write — so a decode bug a future build could fix can't be turned into
+    /// permanent, silent data loss by the next background mutation overwriting
+    /// the only copy with `[]`. If the file was successfully preserved
+    /// (`library.corrupt-<ts>.json`), this stays `false` and saves proceed
+    /// normally against a fresh library.
+    private var refusesToSave = false
+
     private init() {
         storeURL = Self.documentsDirectory.appendingPathComponent("library.json")
-        cache = Self.load(from: storeURL)
+        switch Self.load(from: storeURL) {
+        case .loaded(let recordings):
+            cache = recordings
+        case .missing:
+            cache = []
+        case .corrupt:
+            cache = []
+            // A decode failure is recoverable by a future fix, but only while the
+            // bytes still exist. Preserve them before anything can overwrite the
+            // library with []; if that move fails, protect the file by refusing
+            // to save this session.
+            refusesToSave = !Self.preserveCorrupt(at: storeURL)
+        }
     }
 
     // MARK: - Paths
@@ -218,11 +239,45 @@ final class RecordingStore {
 
     // MARK: - Disk
 
-    private static func load(from url: URL) -> [Recording] {
-        guard let data = try? Data(contentsOf: url),
-              let recordings = try? JSONDecoder().decode([Recording].self, from: data)
-        else { return [] }
-        return recordings.map(strippingControlTokens)
+    /// Outcome of reading `library.json`. The distinction between `.missing` and
+    /// `.corrupt` is the whole point: conflating them (returning `[]` for both)
+    /// let the next `save()` overwrite an unreadable-but-recoverable library with
+    /// an empty one — turning a decode bug into permanent data loss.
+    private enum LoadOutcome {
+        case loaded([Recording])
+        case missing
+        case corrupt
+    }
+
+    private static func load(from url: URL) -> LoadOutcome {
+        // No file at all — a first launch, or a wiped install. Nothing to lose.
+        guard let data = try? Data(contentsOf: url) else { return .missing }
+        // The file exists but doesn't decode. Deliberately *not* swallowed with
+        // `try?` into `[]`: the caller preserves the bytes before any write.
+        guard let recordings = try? JSONDecoder().decode([Recording].self, from: data) else {
+            return .corrupt
+        }
+        return .loaded(recordings.map(strippingControlTokens))
+    }
+
+    /// Move an undecodable `library.json` aside so a later `save()` can't destroy
+    /// the only copy of data a future decode fix could recover. Returns `true`
+    /// when the live path is now clear (safe to write a fresh library), `false`
+    /// when the corrupt file could not be moved and must instead be protected by
+    /// refusing to save this session.
+    private static func preserveCorrupt(at url: URL) -> Bool {
+        let stamp = Int(Date().timeIntervalSince1970)
+        let sidelined = url.deletingLastPathComponent()
+            .appendingPathComponent("library.corrupt-\(stamp).json")
+        do {
+            try FileManager.default.moveItem(at: url, to: sidelined)
+            print("[Store] library.json failed to decode — preserved as \(sidelined.lastPathComponent)")
+            return true
+        } catch {
+            print("[Store] library.json failed to decode and could not be moved aside "
+                + "(\(error)); refusing to save this session to avoid overwriting it")
+            return false
+        }
     }
 
     /// Scrub Soniox control tokens out of transcripts written before
@@ -267,6 +322,13 @@ final class RecordingStore {
     }
 
     private func save() {
+        // An undecodable library at launch that couldn't be preserved aside is
+        // protected here: writing now would overwrite the only recoverable copy
+        // with whatever this session built ([] in the worst case). See `init`.
+        guard !refusesToSave else {
+            print("[Store] save skipped — library failed to decode this launch and is being protected")
+            return
+        }
         guard let data = try? JSONEncoder().encode(cache) else { return }
         // Explicit rather than relying on the platform default (which happens to
         // be the same class today): this file holds every transcript in the

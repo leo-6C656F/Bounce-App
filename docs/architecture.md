@@ -274,6 +274,8 @@ To handle a new SDK callback, implement it in the `PlaudDeviceAgentProtocol` ext
 
 `PlaudWiFiAgent` has its own separate delegate slot, which `SyncManager` claims directly.
 
+**Callbacks that bypass `DeviceManager` must hop to main themselves.** SDK callbacks arrive on SDK-internal queues; `DeviceManager` wraps every one of its forwards in `DispatchQueue.main.async`, which is why `SyncManager`'s `handle*` methods can safely touch the lock-free `RecordingStore` and publish to SwiftUI. Two callback families do **not** pass through that hop: the `AudioExportCallback` object handed to `exportAudio(callback:)` (the BLE download path — `SyncManager` conforms to it directly), and the `PlaudWiFiAgentProtocol` delegate (`wifiHandshake` / `wifiFileList` / …). Both land on an SDK queue and each body hops to main itself — matching the rest of the device layer's main-confinement. Getting this wrong is an off-main mutation of a shared `Array` (heap corruption, or a "Publishing changes from background threads" crash), not a warning; the sibling `WiFiExportHandler` is the pattern to copy.
+
 ### Discovering devices the SDK can't see
 
 `BleAgent.startScan()` scans filtered on service `0x1910`, and iOS only reports peripherals whose advertisement contains that UUID. NotePro **"Find My"** units advertise `0x504C` (ASCII `"PL"`) instead. The result is that `bleScanResult` never fires for them — no error, no empty callback, nothing — and the device is undiscoverable through the SDK.
@@ -418,6 +420,8 @@ Concretely the recorder produces **MPEG-2 (LSF) Layer III, 16 kHz mono**, LAME-e
 ## Stored-model compatibility
 
 `library.json` is one top-level JSON array decoded in a **single** `RecordingStore.load` call. So a field that can't decode doesn't degrade one recording — it loses the whole library.
+
+**A decode failure is contained, not swallowed.** `load` distinguishes three outcomes — loaded, missing, and corrupt — where it once returned `[]` for all three. Conflating "missing" with "corrupt" was itself a data-loss trap: an unreadable-but-recoverable library decoded as empty, and the next `save()` (including a background sync) overwrote it with `[]`, making a bug that a later build could have fixed permanent. Now an undecodable file is moved aside to `library.corrupt-<timestamp>.json` before any write, and if it can't be moved the store refuses to `save()` for the rest of the session rather than overwrite the only copy. `tools/library-decode-tests` locks the premise the split rests on: corruption must actually fail to decode, never collapse to `[]`.
 
 **Every stored field must be `Optional`. A default value does not work.** A default is used by the memberwise initialiser only; synthesised `init(from:)` still calls `decode(_:forKey:)` for a non-optional property and throws `keyNotFound`. This shipped as a real bug: `Recording.deliveredTo` was `var deliveredTo: [String] = []` and was therefore undecodable from any library predating it. It's now an optional `deliveredToRaw` behind a non-optional computed accessor, with `CodingKeys` preserving the original `"deliveredTo"` key so existing data survives.
 

@@ -231,6 +231,30 @@ struct SilenceDetector {
         return merged
     }
 
+    /// Map speech `segments` — whose times come from `AVAudioFile` PCM decoding —
+    /// onto a target timeline of `frameDuration` seconds, then clamp to it.
+    ///
+    /// The audio editor's `kept` ranges live in the MP3 *frame-index* timeline
+    /// (`MP3Frames.Index.duration`), while these segments live in the *decoded*
+    /// timeline (`levels.duration`). For MP3 the two disagree by decoder
+    /// delay/padding — up to ~70 ms at 16 kHz — so intersecting them directly
+    /// biases every silence cut by a systematic offset, trimming into word
+    /// onsets. Scaling by the duration ratio brings the segments into the frame
+    /// timeline before they meet `kept`; the clamp is the floor of the same fix
+    /// (`0...frameDuration`) for the degenerate case where the ratio is unknown.
+    static func speechRanges(
+        _ segments: [Segment],
+        decodedDuration: TimeInterval,
+        frameDuration: TimeInterval
+    ) -> [ClosedRange<TimeInterval>] {
+        let scale = decodedDuration > 0 ? frameDuration / decodedDuration : 1
+        return segments.map { segment in
+            let start = min(max(0, segment.start * scale), frameDuration)
+            let end = min(max(start, segment.end * scale), frameDuration)
+            return start...end
+        }
+    }
+
     /// The silence threshold, in dBFS.
     ///
     /// Two constraints, whichever is higher: a fixed distance below the loudest

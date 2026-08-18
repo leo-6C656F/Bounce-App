@@ -55,6 +55,11 @@ final class DeviceManager: NSObject, @unchecked Sendable {
     private var isUserDisconnect = false
     private var hasPopulatedDevice = false
     private var autoReconnectTimer: Timer?
+    /// The pending initial-delay block from `startAutoReconnect`. Tracked so
+    /// `stopAutoReconnect` can cancel it — otherwise a device that reconnects
+    /// inside the delay window still gets a repeating scan timer created and
+    /// immediately fired against a connection that already exists.
+    private var autoReconnectInitialDelay: DispatchWorkItem?
     private var autoReconnectAttempts = 0
 
     /// True while an OTA is running. The recorder reboots mid-update, so a
@@ -258,7 +263,15 @@ final class DeviceManager: NSObject, @unchecked Sendable {
         RecordingStore.shared.activeDeviceSN = sn
         connectionStateSubject.send(.scanning)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self else { return }
+            // The disconnect above is async: its confirmation (`bleConnectState`
+            // state 0) lands within ms and publishes `.disconnected`, clobbering
+            // the `.scanning` set above. Re-publish `.scanning` here, right before
+            // the scan, or `bleScanResult`'s auto-reconnect guard (`case
+            // .scanning`) is false when the device reappears and the switch never
+            // reconnects — the user has to rescan by hand.
+            self.connectionStateSubject.send(.scanning)
             PlaudDeviceAgent.shared.startScan()
         }
     }
@@ -342,16 +355,28 @@ final class DeviceManager: NSObject, @unchecked Sendable {
     func startAutoReconnect(initialDelay: TimeInterval = 3.0) {
         stopAutoReconnect()
         autoReconnectAttempts = 0
-        DispatchQueue.main.asyncAfter(deadline: .now() + initialDelay) { [weak self] in
+        let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            self.autoReconnectInitialDelay = nil
             self.autoReconnectTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
                 self?.attemptReconnect()
             }
             self.autoReconnectTimer?.fire()
         }
+        autoReconnectInitialDelay = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + initialDelay, execute: work)
     }
 
     private func attemptReconnect() {
+        // Already back on the device — nothing to reconnect. Without this guard a
+        // timer that outlived the reconnect (e.g. one created by an initial-delay
+        // block that fired just as the device came back) would republish
+        // `.scanning` and scan needlessly during a live session, flipping the UI
+        // out of `.connected`.
+        guard !connectionState.isConnected else {
+            stopAutoReconnect()
+            return
+        }
         autoReconnectAttempts += 1
         guard autoReconnectAttempts <= 10 else {
             stopAutoReconnect()
@@ -362,6 +387,8 @@ final class DeviceManager: NSObject, @unchecked Sendable {
     }
 
     func stopAutoReconnect() {
+        autoReconnectInitialDelay?.cancel()
+        autoReconnectInitialDelay = nil
         autoReconnectTimer?.invalidate()
         autoReconnectTimer = nil
     }
